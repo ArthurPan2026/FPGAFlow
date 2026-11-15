@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://panfpga.org/schemas/fpga-flow-v1.schema.json",
+  "title": "FPGA Flow 项目配置",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project",
+    "stages"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "project": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "flow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "output_dir": {
+          "$ref": "#/$defs/projectRelativePath"
+        },
+        "default_target": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "toolchains": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/toolchain"
+      }
+    },
+    "targets": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object"
+      }
+    },
+    "stages": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/stage"
+      }
+    },
+    "suites": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "$defs": {
+    "command": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S+$"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ]
+    },
+    "toolchain": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "version_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expected_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "build",
+            "test",
+            "validate",
+            "deploy"
+          ]
+        },
+        "needs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/projectRelativePath"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/projectRelativePath"
+          }
+        },
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "cwd": {
+          "$ref": "#/$defs/projectRelativePath"
+        },
+        "toolchains": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "success_markers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failure_markers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "destructive": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "runner": {
+          "enum": [
+            "command",
+            "amd.zynq.jtag",
+            "amd.qspi.program",
+            "amd.uart.commands"
+          ],
+          "default": "command"
+        },
+        "options": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "runner": {
+                "const": "command"
+              }
+            },
+            "required": [
+              "runner"
+            ]
+          },
+          "then": {
+            "required": [
+              "command"
+            ]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "runner"
+              ]
+            }
+          },
+          "then": {
+            "required": [
+              "command"
+            ]
+          }
+        }
+      ]
+    },
+    "projectRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    }
+  },
+  "description": "声明项目阶段、工具链、目标板、输入输出产物和验证套件。"
+}

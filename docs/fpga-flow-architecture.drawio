@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" agent="fpga-flow" version="24.7.17" type="device">
+  <diagram name="FPGAFlow 工具架构" id="fpga-flow-architecture">
+    <mxGraphModel dx="1540" dy="1040" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1540" pageHeight="1040" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="background" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="1460" height="960" as="geometry" />
+        </mxCell>
+        <mxCell id="title" value="FPGAFlow：跨 AMD 项目共享的构建与板级工作流" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="220" y="48" width="1090" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-frame" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;opacity=30;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1330" y="95" width="150" height="880" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-title" value="横切规则" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=15;fontStyle=1;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="105" width="130" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-1" value="工具版本&#xa;锁定" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="150" width="130" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-2" value="目标身份&#xa;唯一匹配" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="280" width="130" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-3" value="输入与产物&#xa;SHA-256" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="410" width="130" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-4" value="Plan 只读&#xa;默认不写板" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="540" width="130" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-5" value="QSPI 显式&#xa;写入与读回" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="670" width="130" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="crosscut-6" value="仿真、UART、&#xa;画面证据分开" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="800" width="130" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="layer-agent-label" value="智能体&#xa;入口" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;fontStyle=1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="95" width="140" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-agent" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="220" y="95" width="1090" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-clients" value="智能体客户端" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="240" y="110" width="510" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-codex" value="Codex CLI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="260" y="150" width="145" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-ross" value="AMD Ross" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="420" y="150" width="145" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-other" value="其他兼容智能体" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="580" y="150" width="150" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-skills" value="智能体技能与文档" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="770" y="110" width="520" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-flow-skill" value="fpga-flow&#xa;技能" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="790" y="150" width="210" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="agent-amd-skills" value="AMD 技能 +&#xa;知识库" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1015" y="150" width="255" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="layer-core-label" value="统一流程&#xa;核心" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;fontStyle=1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="245" width="140" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-core" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="220" y="245" width="1090" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="core-cli-group" value="稳定 CLI 入口" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="240" y="260" width="500" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="core-read" value="doctor / plan /&#xa;status / resume" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="260" y="310" width="220" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="core-actions" value="build / validate /&#xa;deploy / release" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="310" width="220" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="core-state-group" value="可恢复的执行状态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="760" y="260" width="530" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="core-dag" value="阶段 DAG&#xa;缓存决策" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="780" y="310" width="150" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="core-hash" value="输入选择&#xa;SHA-256" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="945" y="310" width="150" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="core-run" value="manifest&#xa;run_id / resume" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="310" width="160" height="75" as="geometry" />
+        </mxCell>
+
+        <mxCell id="layer-amd-label" value="AMD 工具&#xa;适配器" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;fontStyle=1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="445" width="140" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-amd" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="220" y="445" width="1090" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="amd-tools-group" value="AMD 工具与验证后端" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="240" y="460" width="1050" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="amd-vivado" value="Vivado&#xa;Tcl / 综合实现" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="260" y="510" width="185" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="amd-vitis" value="Vitis / HLS&#xa;Platform / App" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="460" y="510" width="185" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="amd-xsct" value="XSCT&#xa;JTAG 联合部署" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="660" y="510" width="185" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="amd-qspi" value="program_flash&#xa;QSPI 读回验证" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="860" y="510" width="185" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="amd-xsim" value="Vivado 仿真器&#xa;RTL 测试套件 / seed" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="510" width="210" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="layer-profile-label" value="项目与板卡&#xa;配置" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;fontStyle=1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="625" width="140" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-profile" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="220" y="625" width="1090" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-project-group" value="项目 profile（存放于消费项目）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="240" y="640" width="500" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-rtl-ps" value="RTL + PS&#xa;项目配置与验收" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="260" y="690" width="225" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-hls-ps" value="HLS + PS&#xa;项目配置与验收" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="505" y="690" width="215" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-board-group" value="板卡 profile" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="760" y="640" width="530" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-device" value="器件 / 板卡 Part&#xa;目标身份" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="780" y="690" width="230" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-transport" value="JTAG / QSPI / UART&#xa;传输与验收入口" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1025" y="690" width="245" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="layer-evidence-label" value="运行产物&#xa;与证据" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;fontStyle=1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="805" width="140" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-evidence" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="220" y="805" width="1090" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="evidence-group" value="按项目 out/ 与 run_id 归档" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1;verticalAlign=top;align=center;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="240" y="820" width="1050" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="evidence-artifacts" value="bit / XSA / XPFM&#xa;ELF / BOOT.BIN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="260" y="870" width="300" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="evidence-tests" value="主机 / RTL / UART&#xa;QSPI 读回结果" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="580" y="870" width="300" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="evidence-provenance" value="命令 / 报告 /&#xa;哈希 / 时间戳" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="900" y="870" width="360" height="65" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

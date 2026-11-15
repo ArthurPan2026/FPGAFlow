@@ -1,0 +1,91 @@
+# AMD Zynq-7000 RTL + PS 通用示例。
+# 接入消费项目时，替换为该项目自己的脚本和产物名称。
+schema_version = 1
+
+[project]
+name = "zynq7000-rtl-ps-example"
+description = "以 RTL 为主、可选包含 PS 应用的 AMD Zynq-7000 项目"
+
+[flow]
+output_dir = "out/fpga-flow"
+default_target = "zybo_z7_20"
+
+[toolchains.vivado]
+command = "vivado"
+version_args = ["-version"]
+expected_version = "2025.2.1"
+
+[toolchains.vitis]
+command = "vitis"
+version_args = ["-version"]
+expected_version = "2025.2.1"
+
+[toolchains.xsct]
+command = "xsct"
+version_args = ["-version"]
+expected_version = "2025.2.1"
+
+[targets.zybo_z7_20]
+family = "amd-zynq-7000"
+part = "xc7z020clg400-1"
+board_part = "digilentinc.com:zybo-z7-20:part0:1.2"
+hw_server_url = "tcp:127.0.0.1:3121"
+
+[stages.hardware]
+kind = "build"
+inputs = ["rtl/**/*.sv", "rtl/**/*.vhd", "vivado/**/*.tcl", "constraints/**/*.xdc", "ip/**/*.xci"]
+outputs = ["out/hardware/system.bit", "out/hardware/system.xsa"]
+command = ["vivado", "-mode", "batch", "-source", "scripts/build_hardware.tcl"]
+toolchains = ["vivado"]
+timeout_seconds = 14400
+description = "综合并实现 PL 设计，然后导出 XSA"
+
+[stages.platform]
+kind = "build"
+needs = ["hardware"]
+inputs = ["ps/platform/**/*.yaml", "scripts/build_ps.py"]
+outputs = ["out/platform/platform.xpfm", "out/platform/fsbl.elf", "out/platform/ps7_init.tcl"]
+command = ["vitis", "-s", "scripts/build_ps.py", "--stage", "platform"]
+toolchains = ["vitis"]
+timeout_seconds = 7200
+
+[stages.app]
+kind = "build"
+needs = ["platform"]
+inputs = ["ps/app/src/**/*.c", "ps/app/src/**/*.h", "ps/app/CMakeLists.txt"]
+outputs = ["out/app/application.elf"]
+command = ["vitis", "-s", "scripts/build_ps.py", "--stage", "app"]
+toolchains = ["vitis"]
+timeout_seconds = 7200
+
+[stages.rtl_smoke]
+kind = "test"
+inputs = ["tests/rtl/**/*.sv", "tests/rtl/**/*.vhd"]
+outputs = ["out/tests/rtl-smoke/result.json"]
+command = ["python", "scripts/run_rtl.py", "--suite", "smoke", "--seed", "1"]
+toolchains = ["vivado"]
+timeout_seconds = 7200
+success_markers = ["SUITE_PASS"]
+
+[stages.board_smoke]
+kind = "validate"
+needs = ["app"]
+target = "zybo_z7_20"
+inputs = ["tests/board/board_smoke.py"]
+outputs = ["out/board/board-smoke.json"]
+command = ["python", "tests/board/board_smoke.py", "--profile", "zybo_z7_20"]
+timeout_seconds = 180
+success_markers = ["BOARD_SMOKE_PASS"]
+
+[stages.deploy_jtag]
+kind = "deploy"
+needs = ["hardware", "platform", "app"]
+target = "zybo_z7_20"
+toolchains = ["xsct"]
+runner = "amd.zynq.jtag"
+destructive = true
+options = { bitstream = "out/hardware/system.bit", ps_init_script = "out/platform/ps7_init.tcl", elf = "out/app/application.elf", hw_server_url = "tcp:127.0.0.1:3121", run_ms = 1000, ps_target_pattern = "APU", pl_target_pattern = "xc7z020*", cpu_target_pattern = "ARM Cortex-A9 MPCore #0", ps_init_commands = ["ps7_init", "ps7_post_config"] }
+
+[suites]
+smoke = ["rtl_smoke"]
+board = ["board_smoke"]

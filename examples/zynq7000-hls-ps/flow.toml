@@ -1,0 +1,105 @@
+# AMD Zynq-7000 通用配置示例，包含可选的 Vitis HLS 阶段。
+# HLS 阶段与其他 DAG 节点相同；不使用 HLS 的项目可完全省略这些阶段。
+schema_version = 1
+
+[project]
+name = "zynq7000-hls-ps-example"
+description = "包含 HLS、Vivado 和 Vitis Embedded 阶段的通用流程"
+
+[flow]
+output_dir = "out/fpga-flow"
+default_target = "zybo_z7_20"
+
+[toolchains.vivado]
+command = "vivado"
+version_args = ["-version"]
+expected_version = "2025.2.1"
+
+[toolchains.vitis]
+command = "vitis"
+version_args = ["-version"]
+expected_version = "2025.2.1"
+
+[toolchains.xsct]
+command = "xsct"
+version_args = ["-version"]
+expected_version = "2025.2.1"
+
+[toolchains.program_flash]
+command = "program_flash"
+version_command = ["vitis", "-version"]
+expected_version = "Vitis v2025.2.1"
+
+[targets.zybo_z7_20]
+family = "amd-zynq-7000"
+part = "xc7z020clg400-1"
+board_part = "digilentinc.com:zybo-z7-20:part0:1.2"
+hw_server_url = "tcp:127.0.0.1:3121"
+qspi_flash_type = "qspi-x4-single"
+qspi_offset = 0
+
+[stages.hls_csim]
+kind = "test"
+inputs = ["hls/src/**/*.cpp", "hls/src/**/*.hpp", "hls/cfg/**/*.cfg"]
+outputs = ["out/hls/csim/result.json"]
+command = ["vitis-run", "--mode", "hls", "--csim", "--config", "hls/cfg/component.cfg"]
+toolchains = ["vitis"]
+timeout_seconds = 7200
+success_markers = ["CSIM_PASS"]
+
+[stages.hls_synth]
+kind = "build"
+needs = ["hls_csim"]
+inputs = ["hls/src/**/*.cpp", "hls/src/**/*.hpp", "hls/cfg/**/*.cfg"]
+outputs = ["out/hls/ip/component.xml", "out/hls/reports/csynth.rpt"]
+command = ["vitis-run", "--mode", "hls", "--csynth", "--config", "hls/cfg/component.cfg"]
+toolchains = ["vitis"]
+timeout_seconds = 7200
+
+[stages.hardware]
+kind = "build"
+needs = ["hls_synth"]
+inputs = ["rtl/**/*.sv", "vivado/**/*.tcl", "constraints/**/*.xdc", "ip/**/*.xci", "out/hls/ip/component.xml"]
+outputs = ["out/hardware/system.bit", "out/hardware/system.xsa"]
+command = ["vivado", "-mode", "batch", "-source", "scripts/build_hardware.tcl"]
+toolchains = ["vivado"]
+timeout_seconds = 14400
+
+[stages.platform]
+kind = "build"
+needs = ["hardware"]
+inputs = ["ps/platform/**/*.yaml", "scripts/build_ps.py"]
+outputs = ["out/platform/platform.xpfm", "out/platform/fsbl.elf", "out/platform/ps7_init.tcl"]
+command = ["vitis", "-s", "scripts/build_ps.py", "--stage", "platform"]
+toolchains = ["vitis"]
+timeout_seconds = 7200
+
+[stages.app]
+kind = "build"
+needs = ["platform"]
+inputs = ["ps/app/src/**/*.c", "ps/app/src/**/*.h", "ps/app/CMakeLists.txt"]
+outputs = ["out/app/application.elf"]
+command = ["vitis", "-s", "scripts/build_ps.py", "--stage", "app"]
+toolchains = ["vitis"]
+timeout_seconds = 7200
+
+[stages.boot]
+kind = "build"
+needs = ["app", "hardware", "platform"]
+inputs = ["boot/boot.bif"]
+outputs = ["out/boot/BOOT.BIN"]
+command = ["bootgen", "-arch", "zynq", "-image", "boot/boot.bif", "-o", "out/boot/BOOT.BIN", "-w"]
+toolchains = ["vitis"]
+timeout_seconds = 1800
+
+[stages.qspi_program]
+kind = "deploy"
+needs = ["boot", "platform"]
+target = "zybo_z7_20"
+toolchains = ["program_flash"]
+runner = "amd.qspi.program"
+destructive = true
+options = { boot_image = "out/boot/BOOT.BIN", fsbl = "out/platform/fsbl.elf", flash_type = "qspi-x4-single", offset = 0, target_device_name = "arm_dap", target_name_contains = "Zybo Z7", server_url = "tcp:127.0.0.1:3121" }
+
+[suites]
+hls = ["hls_csim"]
