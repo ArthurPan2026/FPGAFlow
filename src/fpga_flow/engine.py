@@ -1344,13 +1344,20 @@ class FlowEngine:
                 previous = self.store.stage_record(manifest, row["stage"]) or summary
             except ManifestError:
                 previous = summary
-            rows.append({**row,
-                         "last_status": summary.get("status") if isinstance(summary, Mapping) else None,
-                         "last_run_id": summary.get("run_id") if isinstance(summary, Mapping) else None,
-                         "last_error": previous.get("error") if isinstance(previous, Mapping) else None,
-                         "last_success_run_id": (summary.get("last_success_run_id") or (summary.get("run_id") if summary.get("status") == "succeeded" else None)) if isinstance(summary, Mapping) else None,
-                         "last_evidence": _evidence_status(self.profile.root, previous, self.store)
-                         if isinstance(previous, Mapping) else "missing"})
+            last_status = summary.get("status") if isinstance(summary, Mapping) else None
+            status_row = {
+                **row,
+                "last_status": last_status,
+                "last_run_id": summary.get("run_id") if isinstance(summary, Mapping) else None,
+                "last_error": previous.get("error") if isinstance(previous, Mapping) else None,
+                "last_success_run_id": (summary.get("last_success_run_id") or (summary.get("run_id") if last_status == "succeeded" else None)) if isinstance(summary, Mapping) else None,
+                "last_evidence": _evidence_status(self.profile.root, previous, self.store)
+                if isinstance(previous, Mapping) else "missing",
+            }
+            if (row.get("action") in {"explicit-deploy-only", "validate"}
+                    and last_status in {"running", "succeeded", "failed"}):
+                status_row["status"] = last_status
+            rows.append(status_row)
         run_ids = list(manifest.get("run_ids", []))
         return {
             "status": "ok", "project": self.profile.project_name, "target": plan["target"],

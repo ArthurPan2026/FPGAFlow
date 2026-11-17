@@ -705,6 +705,35 @@ class EngineIntegrationTests(unittest.TestCase):
         self.assertEqual((self.root / "out/flash.count").read_text(encoding="utf-8"), "2")
         self.assertEqual((self.root / "out/flash.receipt").read_text(encoding="utf-8"), "programmed v2")
 
+    def test_status_reports_last_explicit_deploy_result_without_changing_plan_guard(self) -> None:
+        stages = {
+            "hardware": _count_stage("out/hardware.bit"),
+            "deploy_jtag": {
+                "kind": "deploy",
+                "needs": ["hardware"],
+                "target": "zybo",
+                "command": [sys.executable, "tools/fake_stage.py", "target",
+                            "out/jtag.receipt", "{target}"],
+                "outputs": ["out/jtag.receipt"],
+                "toolchains": ["python"],
+            },
+        }
+        engine = self._engine(
+            stages, targets={"zybo": {"family": "amd-zynq-7000"}}
+        )
+        engine.build("hardware")
+        engine.deploy("zybo", stage_name="deploy_jtag")
+
+        planned = next(row for row in engine.plan(target="zybo")["stages"]
+                       if row["stage"] == "deploy_jtag")
+        current = next(row for row in engine.status(target="zybo")["stages"]
+                       if row["stage"] == "deploy_jtag")
+        self.assertEqual(planned["action"], "explicit-deploy-only")
+        self.assertEqual(planned["status"], "blocked")
+        self.assertEqual(current["action"], "explicit-deploy-only")
+        self.assertEqual(current["status"], "succeeded")
+        self.assertEqual(current["last_status"], "succeeded")
+
     def test_status_detects_tampered_run_evidence(self) -> None:
         engine = self._engine({"hardware": _count_stage("out/hardware.bit")})
         run = engine.build("hardware")["stages"][0]
