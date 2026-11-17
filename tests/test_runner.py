@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -50,6 +51,52 @@ class CommandRunnerTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 124)
             saved = json.loads((root / "timeout/execution.json").read_text(encoding="utf-8"))
             self.assertTrue(saved["timed_out"])
+
+    def test_logs_are_visible_before_the_child_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs = root / "stream"
+            observed_live_output = []
+
+            def on_progress(stats):
+                path = logs / "stdout.log"
+                if path.is_file():
+                    observed_live_output.append(path.read_text(encoding="utf-8"))
+
+            result = run_command(
+                [sys.executable, "-c",
+                 "import time; print('first', flush=True); time.sleep(.5); print('last', flush=True)"],
+                cwd=root, log_dir=logs, timeout_seconds=3,
+                on_progress=on_progress, progress_interval_seconds=0.05,
+            )
+            self.assertTrue(result.succeeded, result.stderr)
+            self.assertTrue(any("first" in value and "last" not in value for value in observed_live_output))
+            self.assertEqual((logs / "stdout.log").read_text(encoding="utf-8"), "first\nlast\n")
+
+    @unittest.skipUnless(os.name == "posix", "process groups are validated on POSIX")
+    def test_timeout_terminates_child_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            code = (
+                "import subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+                "print(child.pid, flush=True); time.sleep(30)"
+            )
+            result = run_command([sys.executable, "-c", code], cwd=root,
+                                 timeout_seconds=0.3, log_dir=root / "tree")
+            self.assertTrue(result.timed_out)
+            child_pid = int(result.stdout.strip().splitlines()[0])
+            for _ in range(30):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                stat = Path(f"/proc/{child_pid}/stat")
+                if stat.is_file() and stat.read_text().split()[2] == "Z":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("timeout left a child process running")
 
     @unittest.skipUnless(os.name == "nt", "requires Windows batch command semantics")
     def test_windows_batch_command_and_paths_with_spaces(self) -> None:

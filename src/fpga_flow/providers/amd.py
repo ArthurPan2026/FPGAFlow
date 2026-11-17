@@ -18,6 +18,7 @@ from ..amd_deploy import (
     parse_program_flash_targets,
     program_flash_query_argv,
     render_zynq_jtag_program_tcl,
+    render_zynq_jtag_probe_tcl,
     select_unique_flash_target,
 )
 from ..fingerprint import FingerprintError, hash_artifact
@@ -84,6 +85,34 @@ def _now() -> str:
 class ZynqJTAGProvider:
     """使用 XSCT 执行 PL+PS 联合部署，并由 profile 提供目标筛选条件。"""
 
+    def preflight(self, stage: StageConfig, profile: FlowConfig, run_dir: Path,
+                  target: str | None) -> dict[str, Any]:
+        options = _target_options(stage, profile, target)
+        required = ("hw_server_url", "ps_target_pattern", "pl_target_pattern", "cpu_target_pattern")
+        missing = [name for name in required if name not in options]
+        if missing:
+            raise AMDProviderError(f"JTAG profile 缺少预检选项：{', '.join(missing)}")
+        script = run_dir / "jtag_preflight.tcl"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(render_zynq_jtag_probe_tcl(
+            hw_server_url=str(options["hw_server_url"]),
+            ps_target_pattern=str(options["ps_target_pattern"]),
+            pl_target_pattern=str(options["pl_target_pattern"]),
+            cpu_target_pattern=str(options["cpu_target_pattern"]),
+        ), encoding="utf-8", newline="\n")
+        command = [*_toolchain_prefix(stage, profile, "xsct"), str(script)]
+        result = run_command(command, cwd=profile.root, env=stage.env,
+                             timeout_seconds=min(stage.timeout_seconds or 45, 45),
+                             log_dir=run_dir / "jtag-probe")
+        if not result.succeeded:
+            raise AMDProviderError(result.error or "XSCT JTAG 只读预检失败")
+        required_markers = ("PREFLIGHT_TARGET_OK PS", "PREFLIGHT_TARGET_OK PL",
+                            "PREFLIGHT_TARGET_OK CPU", "PREFLIGHT_READ_ONLY")
+        if any(marker not in result.stdout for marker in required_markers):
+            raise AMDProviderError("XSCT 输出缺少唯一目标预检结果")
+        return {"status": "ok", "read_only": True,
+                "targets": [line for line in result.stdout.splitlines() if line.startswith("PREFLIGHT_TARGET_OK")]}
+
     def execute(self, stage: StageConfig, profile: FlowConfig, run_dir: Path,
                 target: str | None) -> CommandResult:
         options = _target_options(stage, profile, target)
@@ -122,6 +151,31 @@ class ZynqJTAGProvider:
 
 class QSPIProgramProvider:
     """对一个 QSPI 镜像进行编程，并执行空白检查和读回验证。"""
+
+    def preflight(self, stage: StageConfig, profile: FlowConfig, run_dir: Path,
+                  target: str | None) -> dict[str, Any]:
+        options = _target_options(stage, profile, target)
+        if "target_device_name" not in options:
+            raise AMDProviderError("QSPI profile 缺少 target_device_name")
+        server_url = str(options.get("server_url", ""))
+        prefix = _toolchain_prefix(stage, profile, "program_flash")
+        query = [*prefix, "-jtagtargets", "-url", server_url]
+        result = run_command(query, cwd=profile.root, env=stage.env,
+                             timeout_seconds=min(stage.timeout_seconds or 90, 90),
+                             log_dir=run_dir / "qspi-target-query")
+        if not result.succeeded:
+            raise AMDProviderError(result.error or "program_flash JTAG 目标查询失败")
+        targets = parse_program_flash_targets(result.stdout + "\n" + result.stderr)
+        try:
+            selected = select_unique_flash_target(
+                targets, device_name=str(options["target_device_name"]),
+                target_name_contains=options.get("target_name_contains"),
+                idcode=options.get("target_idcode"),
+            )
+        except DeployCommandError as exc:
+            raise AMDProviderError(str(exc)) from exc
+        return {"status": "ok", "read_only": True, "target": dict(selected),
+                "target_count": len(targets)}
 
     def execute(self, stage: StageConfig, profile: FlowConfig, run_dir: Path,
                 target: str | None) -> CommandResult:

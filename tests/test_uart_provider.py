@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import tempfile
 import unittest
 import time
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from fpga_flow.models import FlowConfig, StageConfig
 from fpga_flow.providers.uart import UARTCommandProvider
@@ -150,6 +152,100 @@ class UARTProviderTests(unittest.TestCase):
                 UARTCommandProvider(serial_factory=lambda **kwargs: fake,
                                     port_enumerator=lambda: ports + ports).execute(stage, profile, root / "run2", "board_a")
 
+    def test_literal_text_expectation_handles_brackets(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = FakePort({"load": b"[CMD] rom load ok\r\n> "})
+            options = {
+                "steps": [{"send": "load", "expect_text": ["[CMD] rom load ok"]}],
+                "prompt_regex": r">\s*$",
+            }
+            profile, stage = self._profile(root, options, {"port": "COM5"})
+            result = UARTCommandProvider(serial_factory=lambda **kwargs: fake).execute(
+                stage, profile, root / "run", "board_a"
+            )
+            self.assertTrue(result.succeeded, result.stderr)
+
+    def test_transport_timeout_stops_later_uart_steps(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = FakePort({"first": b"partial response"})
+            options = {
+                "steps": [
+                    {"send": "first", "expect_text": ["done"], "timeout_seconds": 0.08,
+                     "prompt_regex": r"READY>\s*$"},
+                    {"send": "second", "expect_text": ["ok"], "prompt_regex": r">\s*$"},
+                ],
+            }
+            profile, stage = self._profile(root, options, {"port": "COM5"})
+            result = UARTCommandProvider(serial_factory=lambda **kwargs: fake).execute(
+                stage, profile, root / "run", "board_a"
+            )
+            self.assertFalse(result.succeeded)
+            self.assertEqual(fake.commands, ["first"])
+            self.assertTrue(result.timed_out)
+
+    def test_assertion_mismatch_continues_only_when_profile_allows_it(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = FakePort({"first": b"not-ready\r\n> ", "second": b"ok\r\n> "})
+            options = {
+                "continue_on_assertion_failure": True,
+                "steps": [
+                    {"send": "first", "expect_text": ["success"]},
+                    {"send": "second", "expect_text": ["ok"]},
+                ],
+                "prompt_regex": r">\s*$",
+            }
+            profile, stage = self._profile(root, options, {"port": "COM5"})
+            result = UARTCommandProvider(serial_factory=lambda **kwargs: fake).execute(
+                stage, profile, root / "run", "board_a"
+            )
+            self.assertFalse(result.succeeded)
+            self.assertEqual(fake.commands, ["first", "second"])
+            self.assertIn("first", result.stderr)
+
+    def test_uart_preflight_enumerates_without_opening_or_sending(self):
+        with __import__("tempfile").TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile, stage = self._profile(
+                root, {"steps": [{"send": "status", "expect_text": ["ok"]}]},
+                {"port": "COM5"},
+            )
+            def unexpected_open(**kwargs):
+                raise AssertionError("preflight must not open the port")
+            result = UARTCommandProvider(
+                serial_factory=unexpected_open,
+                port_enumerator=lambda: [FakePortInfo()],
+            ).preflight(stage, profile, root / "preflight", "board_a")
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["bytes_sent"], 0)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX symlink semantics")
+    def test_uart_preflight_resolves_stable_symlink_to_enumerated_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device = root / "ttyUSB1"
+            device.touch()
+            stable_alias = root / "by-id" / "usb-device-port0"
+            stable_alias.parent.mkdir()
+            stable_alias.symlink_to(device)
+            profile, stage = self._profile(
+                root, {"steps": [{"send": "status", "expect_text": ["ok"]}]},
+                {"port": str(stable_alias)},
+            )
+
+            def unexpected_open(**kwargs):
+                raise AssertionError("preflight must not open the serial port")
+
+            result = UARTCommandProvider(
+                serial_factory=unexpected_open,
+                port_enumerator=lambda: [SimpleNamespace(device=str(device))],
+            ).preflight(stage, profile, root / "preflight", "board_a")
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["port"], str(stable_alias))
+            self.assertEqual(result["bytes_sent"], 0)
+
     def test_missing_expected_uart_response_fails_with_transcript(self):
         with __import__("tempfile").TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -158,7 +254,7 @@ class UARTProviderTests(unittest.TestCase):
             profile, stage = self._profile(root, options, {"port": "COM5"})
             result = UARTCommandProvider(serial_factory=lambda **kwargs: fake).execute(stage, profile, root / "run", "board_a")
             self.assertFalse(result.succeeded)
-            self.assertIn("缺少预期匹配模式", result.error or "")
+            self.assertIn("缺少预期正则", result.error or "")
             self.assertIn("no status here", result.stdout)
 
 

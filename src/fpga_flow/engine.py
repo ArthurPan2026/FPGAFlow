@@ -1,11 +1,18 @@
 """面向不同 AMD FPGA 项目的构建、验证与板级部署编排引擎。"""
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 import json
+import os
+import shlex
+import shutil
+import threading
+import time
 import uuid
 
 from .config import ProfileError, topological_order
@@ -15,9 +22,11 @@ from .fingerprint import (
     hash_artifacts,
     hash_inputs,
     sha256_file,
+    sha256_json,
     stage_fingerprint,
 )
 from .manifest import ManifestError, ManifestStore, SCHEMA_VERSION, utc_now
+from .locking import ProjectRunLock, RunLockError
 from .models import FlowConfig, StageConfig
 from .runner import CommandResult, run_command
 from .toolchains import ToolchainResult, probe_toolchain
@@ -252,20 +261,163 @@ def _evidence_status(root: Path, record: Mapping[str, Any] | None, store: Manife
     return "tampered-or-missing"
 
 
+def _file_contains(path: Path, marker: str) -> bool:
+    needle = marker.encode("utf-8")
+    overlap = b""
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    return False
+                data = overlap + chunk
+                if needle in data:
+                    return True
+                overlap = data[-max(0, len(needle) - 1):] if len(needle) > 1 else b""
+    except OSError:
+        return False
+
+
+def _marker_in_logs(run_dir: Path, marker: str, fallback: str) -> bool:
+    if marker in fallback:
+        return True
+    for path in run_dir.rglob("*"):
+        if path.is_file() and path.name in {"stdout.log", "stderr.log"} and _file_contains(path, marker):
+            return True
+    return False
+
+
+def _output_patterns_overlap(left: str, right: str) -> bool:
+    def split(pattern: str) -> tuple[tuple[str, ...], bool]:
+        parts = tuple(part for part in pattern.replace("\\", "/").split("/") if part)
+        prefix = []
+        wildcard = False
+        for part in parts:
+            if any(char in part for char in "*?[]"):
+                wildcard = True
+                break
+            prefix.append(part)
+        return tuple(prefix if wildcard else parts), wildcard
+
+    left_base, left_wild = split(left)
+    right_base, right_wild = split(right)
+    if not left_wild and not right_wild:
+        return (left_base == right_base
+                or left_base == right_base[:len(left_base)]
+                or right_base == left_base[:len(right_base)])
+    shorter, longer = (left_base, right_base) if len(left_base) <= len(right_base) else (right_base, left_base)
+    return longer[:len(shorter)] == shorter
+
+
 class FlowEngine:
     """按项目定义的阶段图执行任务，并记录缓存与运行来源。"""
-    def __init__(self, profile: FlowConfig, *, providers: Mapping[str, StageProvider] | None = None):
+    def __init__(self, profile: FlowConfig, *, providers: Mapping[str, StageProvider] | None = None,
+                 progress_callback: Callable[[Mapping[str, Any]], None] | None = None):
         self.profile = profile
         self.store = ManifestStore(profile.root, profile.output_dir, profile.project_name)
         self.providers = dict(_PROVIDER_REGISTRY)
         if providers:
             self.providers.update(providers)
+        self.progress_callback = progress_callback
+        self._active_run_lock: ProjectRunLock | None = None
+        self._wait_lock_current = False
         self._completed_in_session: set[str] = set()
+        self._session_lock = threading.RLock()
 
     @classmethod
-    def from_file(cls, config_path: str | Path = "fpga-flow.toml", *, providers: Mapping[str, StageProvider] | None = None) -> "FlowEngine":
+    def from_file(cls, config_path: str | Path = "fpga-flow.toml", *,
+                  providers: Mapping[str, StageProvider] | None = None,
+                  progress_callback: Callable[[Mapping[str, Any]], None] | None = None) -> "FlowEngine":
         from .config import load_profile
-        return cls(load_profile(config_path), providers=providers)
+        return cls(load_profile(config_path), providers=providers, progress_callback=progress_callback)
+
+    def _notify(self, event: Mapping[str, Any]) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(dict(event))
+        except Exception:
+            pass
+
+    @contextmanager
+    def _mutation_guard(self, action: str, *, wait_lock: bool = False) -> Iterator[ProjectRunLock]:
+        lock = ProjectRunLock(self.store.lock_path, action=action, wait=wait_lock)
+        try:
+            lock.__enter__()
+        except RunLockError as exc:
+            raise FlowError("FLOW-LOCK-BUSY", str(exc)) from exc
+        previous_wait = self._wait_lock_current
+        self._active_run_lock = lock
+        self._wait_lock_current = wait_lock
+        try:
+            yield lock
+        finally:
+            self._wait_lock_current = previous_wait
+            self._active_run_lock = None
+            lock.__exit__(None, None, None)
+
+    def _target_resource_lock_path(self, target: str | None) -> Path | None:
+        if target is None:
+            return None
+        profile = self.profile.targets.get(target)
+        if not isinstance(profile, Mapping):
+            return None
+        identity = profile.get("hardware_identity")
+        if isinstance(identity, Mapping) and identity:
+            stable = dict(identity)
+        else:
+            stable = {
+                key: profile[key] for key in ("board_id", "serial_number", "jtag_id", "target_id", "device_id")
+                if key in profile
+            }
+            for section_name in ("uart", "jtag"):
+                section = profile.get(section_name)
+                if isinstance(section, Mapping):
+                    keys = ("serial_number", "serial_id", "port", "vid", "pid", "interface",
+                            "target_id", "idcode", "device_id")
+                    values = {key: section[key] for key in keys if key in section}
+                    if values:
+                        stable[section_name] = values
+        if not stable:
+            return None
+        digest = sha256_json(stable)
+        override = os.environ.get("FPGA_FLOW_LOCK_DIR")
+        if override:
+            root = Path(override).expanduser()
+        elif os.name == "nt":
+            root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "FPGAFlow" / "target-locks"
+        else:
+            root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "fpga-flow" / "target-locks"
+        return root / f"{digest}.lock"
+
+    @contextmanager
+    def _stage_target_lock(self, stage: StageConfig, target: str | None, run_id: str) -> Iterator[None]:
+        if stage.kind not in {"deploy", "validate"}:
+            yield
+            return
+        lock_path = self._target_resource_lock_path(stage.target or target)
+        if lock_path is None:
+            yield
+            return
+        lock = ProjectRunLock(lock_path, action=f"{stage.kind}:{stage.name}", wait=self._wait_lock_current)
+        try:
+            with lock:
+                lock.set_stage(stage.name, run_id)
+                lock.set_run(run_id)
+                try:
+                    yield
+                finally:
+                    lock.clear_stage(run_id)
+        except RunLockError as exc:
+            raise FlowError("FLOW-TARGET-LOCK-BUSY", str(exc)) from exc
+
+    def _check_side_effects(self, stages: Sequence[str], allow_side_effects: bool) -> None:
+        required = [(name, self.profile.stages[name].side_effects) for name in stages
+                    if self.profile.stages[name].side_effects]
+        if required and not allow_side_effects:
+            detail = "; ".join(f"{name}={','.join(effects)}" for name, effects in required)
+            raise FlowError("FLOW-SIDE-EFFECT-ACK",
+                            "运行这些阶段前必须显式传入 --allow-side-effects：" + detail)
 
     def _target(self, requested: str | None, stage: StageConfig | None = None) -> str | None:
         selected = requested or (stage.target if stage else None) or self.profile.default_target
@@ -290,7 +442,8 @@ class FlowEngine:
             config = self.profile.toolchains[name]
             command, version_args = self._toolchain_command(name)
             probe = probe_toolchain(name, command, version_args, config.expected_version,
-                                    cwd=self.profile.root, log_dir=run_dir / "toolchains" / name)
+                                    cwd=self.profile.root, log_dir=run_dir / "toolchains" / name,
+                                    failure_markers=config.failure_markers)
             detail = {"name": probe.name, "configured_command": probe.configured_command,
                       "resolved_command": probe.resolved_command, "expected_version": probe.expected_version,
                       "reported_version": probe.reported_version, "status": probe.status,
@@ -301,21 +454,35 @@ class FlowEngine:
             versions[name] = _tool_version_value(probe)
         return versions, details
 
-    def _probe_all_toolchains(self, run_dir: Path) -> tuple[dict[str, str], dict[str, dict[str, Any]], bool]:
+    def _probe_all_toolchains(
+        self, run_dir: Path, names: Sequence[str] | None = None
+    ) -> tuple[dict[str, str], dict[str, dict[str, Any]], bool]:
         versions: dict[str, str] = {}
         details: dict[str, dict[str, Any]] = {}
         okay = True
-        for name, config in self.profile.toolchains.items():
+        selected = list(names) if names is not None else list(self.profile.toolchains)
+        for name in dict.fromkeys(selected):
+            config = self.profile.toolchains.get(name)
+            if config is None:
+                details[name] = {"name": name, "status": "missing",
+                                 "detail": "阶段引用了未配置的工具链", "unlocked": False}
+                okay = False
+                continue
             command, version_args = self._toolchain_command(name)
-            probe = probe_toolchain(name, command, version_args, config.expected_version,
-                                    cwd=self.profile.root, log_dir=run_dir / "toolchains" / name)
-            details[name] = {"name": probe.name, "configured_command": probe.configured_command,
-                             "resolved_command": probe.resolved_command, "expected_version": probe.expected_version,
-                             "reported_version": probe.reported_version, "status": probe.status,
-                             "detail": probe.detail, "unlocked": config.expected_version is None}
+            probe = probe_toolchain(
+                name, command, version_args, config.expected_version,
+                cwd=self.profile.root, log_dir=run_dir / "toolchains" / name,
+                failure_markers=config.failure_markers,
+            )
+            details[name] = {
+                "name": probe.name, "configured_command": probe.configured_command,
+                "resolved_command": probe.resolved_command, "expected_version": probe.expected_version,
+                "reported_version": probe.reported_version, "status": probe.status,
+                "detail": probe.detail, "unlocked": config.expected_version is None,
+            }
             if probe.ok:
                 versions[name] = _tool_version_value(probe)
-            else:
+            elif probe.status != "warning":
                 okay = False
         return versions, details, okay
 
@@ -375,18 +542,35 @@ class FlowEngine:
             return False, "profile 中没有该阶段", None
         if manifest is None:
             manifest = self.store.load()
-        records = manifest.get("stages", {})
-        record = records.get(stage_name) if isinstance(records, Mapping) else None
-        context_target = stage.target or target or (record.get("target") if isinstance(record, Mapping) else None) or self.profile.default_target
+        stages = manifest.get("stages", {})
+        summary = stages.get(stage_name) if isinstance(stages, Mapping) else None
+        context_target = (stage.target or target
+                          or (summary.get("target") if isinstance(summary, Mapping) else None)
+                          or self.profile.default_target)
         memo_key = (stage_name, context_target)
         if memo_key in memo:
             return memo[memo_key]
         if stage.kind == "validate" and stage_name not in self._completed_in_session:
-            result = (False, "运行时/板级验证是证据，不可作为可复用缓存命中", record if isinstance(record, Mapping) else None)
+            result = (False, "运行时/板级验证是证据，不可作为可复用缓存命中",
+                      summary if isinstance(summary, Mapping) else None)
+            memo[memo_key] = result
+            return result
+        if not isinstance(summary, Mapping):
+            result = (False, "没有成功的阶段运行记录", None)
+            memo[memo_key] = result
+            return result
+        try:
+            record = self.store.successful_stage_record(manifest, stage_name)
+        except ManifestError as exc:
+            result = (False, f"运行记录缺失或损坏：{exc}", dict(summary))
             memo[memo_key] = result
             return result
         if not isinstance(record, Mapping) or record.get("status") != "succeeded":
-            result = (False, "没有成功的阶段运行记录", record if isinstance(record, Mapping) else None)
+            result = (False, "没有可复用的成功阶段运行记录", dict(summary))
+            memo[memo_key] = result
+            return result
+        if not isinstance(record, Mapping) or record.get("status") != "succeeded":
+            result = (False, "不可变运行记录不存在或状态不是成功", summary)
             memo[memo_key] = result
             return result
         versions = self._tool_versions_from_record(stage, record)
@@ -405,8 +589,10 @@ class FlowEngine:
             return result
         try:
             inputs = hash_inputs(self.profile.root, stage.inputs, require_matches=bool(stage.inputs))
-            fingerprint = stage_fingerprint(_stage_contract(self.profile, stage, context_target),
-                                            inputs, dependency_hashes, versions)
+            fingerprint = stage_fingerprint(
+                _stage_contract(self.profile, stage, context_target),
+                inputs, dependency_hashes, versions,
+            )
             if record.get("fingerprint") != fingerprint:
                 result = (False, "输入、依赖、工具链、目标或阶段配置已改变", record)
             elif stage.outputs and not _outputs_match(record, fingerprint, stage.outputs, self.profile.root):
@@ -415,7 +601,7 @@ class FlowEngine:
                 result = (False, "无输出阶段却记录了产物", record)
             else:
                 result = (True, "输入指纹与产物哈希均匹配", record)
-        except (FlowError, FingerprintError, OSError, ValueError) as exc:
+        except (FlowError, FingerprintError, ManifestError, OSError, ValueError) as exc:
             result = (False, f"无法验证阶段产物：{exc}", record)
         memo[memo_key] = result
         return result
@@ -454,8 +640,12 @@ class FlowEngine:
                 raise FlowError("FLOW-CWD-INVALID", f"阶段工作目录超出项目根目录或不存在：{stage.cwd}") from exc
             env = {key: _format_value(value, fields, f"stages.{stage.name}.env.{key}")
                    for key, value in stage.env.items()}
+            def progress(stats: Mapping[str, object]) -> None:
+                self._notify({"event": "stage_progress", "stage": stage.name,
+                              "run_id": run_dir.name, **dict(stats)})
             result = run_command(command, cwd=cwd, env=env,
-                                 timeout_seconds=stage.timeout_seconds, log_dir=run_dir)
+                                 timeout_seconds=stage.timeout_seconds, log_dir=run_dir,
+                                 on_progress=progress)
             return result, command
         provider = self.providers[runner]
         result = provider.execute(stage, self.profile, run_dir, target)
@@ -508,20 +698,30 @@ class FlowEngine:
             record["evidence"] = {}
             record["evidence_hash_error"] = str(exc)
         self.store.record_run(run_id, stage.name, record)
+        if self._active_run_lock is not None:
+            self._active_run_lock.clear_stage(run_id)
         if status == "succeeded":
-            self._completed_in_session.add(stage.name)
+            with self._session_lock:
+                self._completed_in_session.add(stage.name)
+        self._notify({"event": "stage_finished", "stage": stage.name, "run_id": run_id,
+                      "status": status, "elapsed_seconds": elapsed_seconds,
+                      "error_code": record.get("error_code")})
         return record
 
-    def _execute_stage(self, stage: StageConfig, *, target: str | None = None, force: bool = False) -> dict[str, Any]:
+    def _execute_stage(self, stage: StageConfig, *, target: str | None = None,
+                       force: bool = False, allow_side_effects: bool = False) -> dict[str, Any]:
+        self._check_side_effects((stage.name,), allow_side_effects)
         self._check_runner(stage)
         selected_target = self._target(target, stage)
         if stage.kind == "deploy" and target is None:
             raise FlowError("FLOW-TARGET-REQUIRED", f"部署阶段 {stage.name!r} 必须显式指定 --target")
         self._require_dependencies(stage, selected_target)
-        # 发布 running 状态前先保留上一次完成的阶段记录，避免 running 指针覆盖可复用的缓存记录。
         pre_manifest = self.store.load()
-        previous_stage_record = pre_manifest.get("stages", {}).get(stage.name, {})
+        previous_stage_record = self.store.successful_stage_record(pre_manifest, stage.name) or {}
         run_id = _new_run_id()
+        if self._active_run_lock is not None:
+            self._active_run_lock.set_stage(stage.name, run_id)
+            self._active_run_lock.set_run(run_id)
         run_dir = self.store.run_path(run_id).parent
         started = utc_now()
         inputs: dict[str, str] = {}
@@ -540,40 +740,57 @@ class FlowEngine:
             "stage": stage.name, "kind": stage.kind, "status": "running", "run_id": run_id,
             "target": selected_target, "started_at_utc": started, "fingerprint": None, "outputs": {},
         })
+        self._notify({"event": "stage_started", "stage": stage.name, "run_id": run_id,
+                      "target": selected_target, "kind": stage.kind})
         try:
             inputs = hash_inputs(self.profile.root, stage.inputs, require_matches=bool(stage.inputs))
             versions, details = self._probe_stage_toolchains(stage, run_dir)
             manifest = self.store.load()
-            dependencies, dependency_error = self._dependency_hashes(stage, manifest, {}, set(), selected_target)
+            dependencies, dependency_error = self._dependency_hashes(
+                stage, manifest, {}, set(), selected_target
+            )
             if dependencies is None:
                 raise FlowError("FLOW-DEPENDENCY-STALE", dependency_error or "依赖阶段已过期")
             fingerprint = stage_fingerprint(
-                _stage_contract(self.profile, stage, selected_target), inputs, dependencies, versions
+                _stage_contract(self.profile, stage, selected_target),
+                inputs, dependencies, versions,
             )
-            previous = previous_stage_record
             cacheable = stage.kind in {"build", "test"} and not force
-            if cacheable and isinstance(previous, Mapping) and _outputs_match(
-                previous, fingerprint, stage.outputs, self.profile.root
+            if cacheable and isinstance(previous_stage_record, Mapping) and _outputs_match(
+                previous_stage_record, fingerprint, stage.outputs, self.profile.root
             ):
-                outputs = dict(previous.get("outputs", {}))
+                outputs = dict(previous_stage_record.get("outputs", {}))
                 (run_dir / "stdout.log").write_text("", encoding="utf-8")
                 (run_dir / "stderr.log").write_text("", encoding="utf-8")
-                _write_json(run_dir / "command.json", {"cache_hit": True, "stage": stage.name,
-                                                        "target": selected_target, "argv": list(command_preview)})
-                _write_json(run_dir / "execution.json", {"succeeded": True, "cache_hit": True})
-                return self._complete_run(stage, run_id, "succeeded", started, target=selected_target,
-                                          inputs=inputs, dependencies=dependencies, tool_versions=versions,
-                                          toolchain_details=details, fingerprint=fingerprint, outputs=outputs,
-                                          command=command_preview, cache_hit=True)
+                _write_json(run_dir / "command.json", {
+                    "cache_hit": True, "stage": stage.name,
+                    "target": selected_target, "argv": list(command_preview),
+                })
+                _write_json(run_dir / "execution.json", {
+                    "succeeded": True, "cache_hit": True,
+                    "started_at_utc": started, "completed_at_utc": utc_now(),
+                })
+                return self._complete_run(
+                    stage, run_id, "succeeded", started, target=selected_target,
+                    inputs=inputs, dependencies=dependencies, tool_versions=versions,
+                    toolchain_details=details, fingerprint=fingerprint, outputs=outputs,
+                    command=command_preview, cache_hit=True, elapsed_seconds=0.0,
+                )
 
-            command_result, command_preview = self._dispatch(stage, run_dir, selected_target)
+            with self._stage_target_lock(stage, selected_target, run_id):
+                command_result, command_preview = self._dispatch(stage, run_dir, selected_target)
             output_text = command_result.stdout + "\n" + command_result.stderr
             if not command_result.succeeded:
-                raise FlowError("FLOW-COMMAND-FAILED", command_result.error or f"命令退出码为 {command_result.exit_code}")
-            failed = [marker for marker in stage.failure_markers if marker in output_text]
+                raise FlowError(
+                    "FLOW-COMMAND-FAILED",
+                    command_result.error or f"命令退出码为 {command_result.exit_code}",
+                )
+            failed = [marker for marker in stage.failure_markers
+                      if _marker_in_logs(run_dir, marker, output_text)]
             if failed:
                 raise FlowError("FLOW-FAILURE-MARKER", f"检测到失败标记：{failed}")
-            missing = [marker for marker in stage.success_markers if marker not in output_text]
+            missing = [marker for marker in stage.success_markers
+                       if not _marker_in_logs(run_dir, marker, output_text)]
             if missing:
                 raise FlowError("FLOW-SUCCESS-MARKER-MISSING", f"缺少成功标记：{missing}")
             try:
@@ -581,73 +798,214 @@ class FlowEngine:
                 outputs = hash_artifacts(self.profile.root, concrete_outputs)
             except (FlowError, FingerprintError, OSError, ValueError) as exc:
                 raise FlowError("FLOW-OUTPUT-INVALID", str(exc)) from exc
-            return self._complete_run(stage, run_id, "succeeded", started, target=selected_target,
-                                      inputs=inputs, dependencies=dependencies, tool_versions=versions,
-                                      toolchain_details=details, fingerprint=fingerprint, outputs=outputs,
-                                      command=command_preview, elapsed_seconds=command_result.elapsed_seconds)
+            return self._complete_run(
+                stage, run_id, "succeeded", started, target=selected_target,
+                inputs=inputs, dependencies=dependencies, tool_versions=versions,
+                toolchain_details=details, fingerprint=fingerprint, outputs=outputs,
+                command=command_preview, elapsed_seconds=command_result.elapsed_seconds,
+            )
         except Exception as exc:
-            error = exc if isinstance(exc, FlowError) else FlowError("FLOW-STAGE-FAILED", f"{type(exc).__name__}：{exc}")
+            error = exc if isinstance(exc, FlowError) else FlowError(
+                "FLOW-STAGE-FAILED", f"{type(exc).__name__}：{exc}"
+            )
             if not (run_dir / "stderr.log").is_file() or not (run_dir / "command.json").is_file():
                 _write_failure_logs(run_dir, command_preview, f"{error.code}: {error}", started)
             (run_dir / "flow-error.txt").write_text(f"{error.code}: {error}\n", encoding="utf-8")
-            self._complete_run(stage, run_id, "failed", started, target=selected_target,
-                               inputs=inputs, dependencies=dependencies, tool_versions=versions,
-                               toolchain_details=details, fingerprint=fingerprint, outputs={},
-                               command=command_preview, error=error,
-                               elapsed_seconds=command_result.elapsed_seconds if command_result else None)
+            self._complete_run(
+                stage, run_id, "failed", started, target=selected_target,
+                inputs=inputs, dependencies=dependencies, tool_versions=versions,
+                toolchain_details=details, fingerprint=fingerprint, outputs={},
+                command=command_preview, error=error,
+                elapsed_seconds=command_result.elapsed_seconds if command_result else None,
+            )
             raise error from exc
+
     def _require_cached(self, stage_name: str, target: str | None = None) -> Mapping[str, Any]:
         valid, reason, record = self._cache_state(stage_name, target=target)
         if not valid or record is None:
             raise FlowError("FLOW-DEPENDENCY-STALE", f"必需阶段 {stage_name!r} 已过期：{reason}")
         return record
 
-    def build(self, stage: str, *, with_deps: bool = False, force: bool = False,
-              target: str | None = None) -> dict[str, Any]:
-        requested = self.profile.stages.get(stage)
-        if requested is None:
-            raise FlowError("FLOW-STAGE-UNKNOWN", f"未知阶段：{stage}")
-        if requested.kind != "build":
-            raise FlowError("FLOW-STAGE-KIND", f"build 需要 kind=build，但阶段 {stage!r} 的 kind 是 {requested.kind!r}")
-        selected_target = self._target(target, requested)
-        order = topological_order(self.profile, [stage]) if with_deps else [stage]
-        completed: list[dict[str, Any]] = []
-        for name in order:
-            current = self.profile.stages[name]
-            if current.kind == "deploy":
-                raise FlowError("FLOW-RELEASE-DEPLOY-BLOCKED", "build --with-deps 不会部署；请显式调用 deploy")
-            if current.kind not in {"build", "test", "validate"}:
-                raise FlowError("FLOW-STAGE-KIND", f"前置阶段 {name!r} 的 kind {current.kind!r} 不受支持")
-            completed.append(self._execute_stage(current, target=selected_target, force=force))
-        return {"status": "succeeded", "operation": "build", "project": self.profile.project_name,
-                "target": selected_target, "stages": completed}
+    def _resource_keys(self, stage: StageConfig, target: str | None) -> set[str]:
+        keys = {f"resource:{item}" for item in stage.resources}
+        exclusive_toolchains = {"vivado", "vitis", "xsct", "program_flash", "bootgen"}
+        for name in stage.toolchains:
+            config = self.profile.toolchains[name]
+            executable = config.command[0]
+            resolved = shutil.which(executable) or executable
+            normalized = os.path.normcase(str(Path(resolved).expanduser().resolve(strict=False)))
+            if name.lower() in exclusive_toolchains or Path(resolved).name.lower() in exclusive_toolchains:
+                keys.add(f"toolchain:{normalized}")
+        runner = _runner_name(stage)
+        if target and (stage.kind in {"deploy", "validate"} or runner.startswith("amd.")):
+            profile = self.profile.targets.get(stage.target or target, {})
+            explicit = profile.get("hardware_identity") if isinstance(profile, Mapping) else None
+            if isinstance(explicit, Mapping) and explicit:
+                identity = dict(explicit)
+            elif isinstance(profile, Mapping):
+                identity = {key: profile[key] for key in ("board_id", "serial_number", "jtag_id", "target_id")
+                            if key in profile}
+            else:
+                identity = {}
+            board_key = json.dumps(identity, sort_keys=True, ensure_ascii=False) if identity else (stage.target or target)
+            keys.add(f"target:{board_key}")
+        return keys
 
-    def validate(self, suite: str, *, force: bool = False, target: str | None = None) -> dict[str, Any]:
-        if suite not in self.profile.suites:
-            raise FlowError("FLOW-SUITE-UNKNOWN", f"未知验证套件 {suite!r}")
-        selected_target = self._target(target)
-        suite_stages = self.profile.suites[suite]
-        order = topological_order(self.profile, suite_stages)
-        selected = set(suite_stages)
-        results: list[dict[str, Any]] = []
-        for name in order:
+    def _execute_schedule(
+        self,
+        order: Sequence[str],
+        execute_names: Sequence[str],
+        *,
+        target: str | None,
+        force: bool,
+        allow_side_effects: bool,
+        deploy_barrier: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        ordered = list(order)
+        deploy_barrier = deploy_barrier or set()
+        execute_order = [name for name in ordered if name in set(execute_names)]
+        execute_set = set(execute_order)
+        for name in ordered:
             stage = self.profile.stages[name]
-            if selected_target and stage.target and stage.target != selected_target:
-                if name in selected:
-                    raise FlowError("FLOW-TARGET-MISMATCH", f"套件 {suite!r} 包含为目标 {stage.target!r} 配置的阶段 {name!r}")
-                self._require_cached(name, stage.target)
+            if name not in execute_set:
+                self._require_cached(name, stage.target or target)
                 continue
+            self._check_runner(stage)
+            self._check_side_effects((name,), allow_side_effects)
+            if stage.kind not in {"build", "test", "validate", "deploy"}:
+                raise FlowError("FLOW-STAGE-KIND", f"不支持的阶段类型：{stage.kind}")
+
+        completed = set(ordered) - execute_set
+        pending = list(execute_order)
+        running: dict[Any, tuple[str, set[str]]] = {}
+        results: dict[str, dict[str, Any]] = {}
+        failures: dict[str, Exception] = {}
+        blocked: dict[str, str] = {}
+        active_resources: set[str] = set()
+        max_workers = max(1, self.profile.max_parallel_stages)
+
+        order_set = set(ordered)
+
+        def dependencies_ready(name: str) -> bool:
+            stage = self.profile.stages[name]
+            needs = all(dep in completed or dep not in order_set for dep in stage.needs)
+            if not needs:
+                return False
+            if stage.kind == "deploy" and deploy_barrier and not deploy_barrier.issubset(completed):
+                return False
+            return True
+
+        def failed_dependency(name: str) -> str | None:
+            stage = self.profile.stages[name]
+            dependencies = list(stage.needs)
             if stage.kind == "deploy":
-                self._require_cached(name, selected_target or stage.target)
-                continue
-            if name not in selected:
-                self._require_cached(name, selected_target)
-                continue
-            if stage.kind not in {"test", "validate"}:
-                raise FlowError("FLOW-SUITE-KIND", f"套件阶段 {name!r} 的 kind 必须是 test 或 validate")
-            results.append(self._execute_stage(stage, target=selected_target, force=force))
-        return {"status": "succeeded", "operation": "validate", "suite": suite,
-                "project": self.profile.project_name, "target": selected_target, "stages": results}
+                dependencies.extend(deploy_barrier)
+            return next((dep for dep in dependencies if dep in failures or dep in blocked), None)
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fpga-flow") as pool:
+            while pending or running:
+                made_progress = False
+                for name in list(pending):
+                    failed_dep = failed_dependency(name)
+                    if failed_dep is not None:
+                        blocked[name] = f"前置阶段 {failed_dep!r} 未通过"
+                        pending.remove(name)
+                        made_progress = True
+                for name in list(pending):
+                    if len(running) >= max_workers:
+                        break
+                    if not dependencies_ready(name):
+                        continue
+                    stage = self.profile.stages[name]
+                    resources = self._resource_keys(stage, target)
+                    if resources & active_resources:
+                        continue
+                    active_stage_names = {entry[0] for entry in running.values()}
+                    output_conflict = any(
+                        _output_patterns_overlap(left, right)
+                        for active_name in active_stage_names
+                        for left in stage.outputs
+                        for right in self.profile.stages[active_name].outputs
+                    )
+                    if output_conflict:
+                        continue
+                    future = pool.submit(
+                        self._execute_stage, stage, target=target, force=force,
+                        allow_side_effects=allow_side_effects,
+                    )
+                    running[future] = (name, resources)
+                    active_resources.update(resources)
+                    pending.remove(name)
+                    made_progress = True
+                if running:
+                    done, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        name, resources = running.pop(future)
+                        active_resources.difference_update(resources)
+                        try:
+                            results[name] = future.result()
+                            completed.add(name)
+                        except Exception as exc:
+                            failures[name] = exc
+                    continue
+                if pending and not made_progress:
+                    for name in pending:
+                        blocked[name] = "依赖阶段未完成，无法调度"
+                    pending.clear()
+
+        if len(failures) == 1 and not blocked:
+            error = next(iter(failures.values()))
+            if isinstance(error, FlowError):
+                raise error
+            raise FlowError("FLOW-STAGE-FAILED", str(error)) from error
+        if failures or blocked:
+            details = [f"{name}: {message}" for name, message in failures.items()]
+            details.extend(f"{name}: {message}" for name, message in blocked.items())
+            raise FlowError("FLOW-SCHEDULE-FAILED", "阶段调度未完成；" + "；".join(details))
+        return [results[name] for name in execute_order]
+
+    def build(self, stage: str, *, with_deps: bool = False, force: bool = False,
+              target: str | None = None, allow_side_effects: bool = False,
+              wait_lock: bool = False) -> dict[str, Any]:
+        with self._mutation_guard("build", wait_lock=wait_lock):
+            requested = self.profile.stages.get(stage)
+            if requested is None:
+                raise FlowError("FLOW-STAGE-UNKNOWN", f"未知阶段：{stage}")
+            if requested.kind != "build":
+                raise FlowError("FLOW-STAGE-KIND", f"build 需要 kind=build，但阶段 {stage!r} 的 kind 是 {requested.kind!r}")
+            selected_target = self._target(target, requested)
+            order = topological_order(self.profile, [stage]) if with_deps else [stage]
+            if any(self.profile.stages[name].kind == "deploy" for name in order):
+                raise FlowError("FLOW-RELEASE-DEPLOY-BLOCKED", "build --with-deps 不会部署；请显式调用 deploy")
+            execute = order if with_deps else [stage]
+            completed = self._execute_schedule(
+                order, execute, target=selected_target, force=force,
+                allow_side_effects=allow_side_effects,
+            )
+            return {"status": "succeeded", "operation": "build", "project": self.profile.project_name,
+                    "target": selected_target, "stages": completed}
+
+    def validate(self, suite: str, *, force: bool = False, target: str | None = None,
+                 allow_side_effects: bool = False, wait_lock: bool = False) -> dict[str, Any]:
+        with self._mutation_guard("validate", wait_lock=wait_lock):
+            if suite not in self.profile.suites:
+                raise FlowError("FLOW-SUITE-UNKNOWN", f"未知验证套件 {suite!r}")
+            selected_target = self._target(target)
+            suite_stages = self.profile.suites[suite]
+            order = topological_order(self.profile, suite_stages)
+            selected = set(suite_stages)
+            for name in suite_stages:
+                stage = self.profile.stages[name]
+                if stage.kind not in {"test", "validate"}:
+                    raise FlowError("FLOW-SUITE-KIND", f"套件阶段 {name!r} 的 kind 必须是 test 或 validate")
+                if selected_target and stage.target and stage.target != selected_target:
+                    raise FlowError("FLOW-TARGET-MISMATCH", f"套件 {suite!r} 包含为目标 {stage.target!r} 配置的阶段 {name!r}")
+            results = self._execute_schedule(
+                order, selected, target=selected_target, force=force,
+                allow_side_effects=allow_side_effects,
+            )
+            return {"status": "succeeded", "operation": "validate", "suite": suite,
+                    "project": self.profile.project_name, "target": selected_target, "stages": results}
 
     def _deploy_stages(self, target: str) -> list[str]:
         return [name for name, stage in self.profile.stages.items()
@@ -677,198 +1035,480 @@ class FlowEngine:
         return candidates
 
     def deploy(self, target: str, *, stage_name: str | None = None,
-               allow_destructive: bool = False) -> dict[str, Any]:
-        selected_target = self._target(target)
-        if selected_target is None:
-            raise FlowError("FLOW-TARGET-REQUIRED", "deploy 必须显式指定 --target")
-        selected = self._select_deploy_stages(selected_target, stage_name)
-        self._check_destructive(selected, allow_destructive)
-        order = topological_order(self.profile, selected)
-        results: list[dict[str, Any]] = []
-        selected_set = set(selected)
-        for name in order:
-            stage = self.profile.stages[name]
-            if stage.kind == "deploy":
-                if name in selected_set and stage.target == selected_target:
-                    results.append(self._execute_stage(stage, target=selected_target, force=True))
-                else:
-                    # 不会隐式串联不同的部署路径。
-                    self._require_cached(name, stage.target or selected_target)
-            else:
-                self._require_cached(name, selected_target)
-        return {"status": "succeeded", "operation": "deploy", "project": self.profile.project_name,
-                "target": selected_target, "deploy_stage": selected[0], "stages": results}
+               allow_destructive: bool = False, allow_side_effects: bool = False,
+               wait_lock: bool = False) -> dict[str, Any]:
+        with self._mutation_guard("deploy", wait_lock=wait_lock):
+            selected_target = self._target(target)
+            if selected_target is None:
+                raise FlowError("FLOW-TARGET-REQUIRED", "deploy 必须显式指定 --target")
+            selected = self._select_deploy_stages(selected_target, stage_name)
+            self._check_destructive(selected, allow_destructive)
+            self._check_side_effects(selected, allow_side_effects)
+            order = topological_order(self.profile, selected)
+            results = self._execute_schedule(
+                order, selected, target=selected_target, force=True,
+                allow_side_effects=allow_side_effects,
+            )
+            return {"status": "succeeded", "operation": "deploy", "project": self.profile.project_name,
+                    "target": selected_target, "deploy_stage": selected[0], "stages": results}
 
     def release(self, *, target: str | None = None, deploy: bool = False,
                 deploy_stage: str | None = None, allow_destructive: bool = False,
-                force: bool = False) -> dict[str, Any]:
-        selected_target = self._target(target)
-        if deploy_stage is not None and not deploy:
-            raise FlowError("FLOW-RELEASE-DEPLOY-OPTIN", "--deploy-stage 必须与显式的 --deploy 一起使用")
-        if deploy and selected_target is None:
-            raise FlowError("FLOW-TARGET-REQUIRED", "release --deploy 必须指定 --target")
-        matching_deploy = self._select_deploy_stages(selected_target, deploy_stage) if deploy and selected_target else []
-        if deploy:
-            self._check_destructive(matching_deploy, allow_destructive)
-        selected = [name for name, stage in self.profile.stages.items()
-                    if stage.kind in {"build", "test", "validate"}
-                    and (selected_target is None or stage.target is None or stage.target == selected_target)]
-        if deploy:
-            selected.extend(matching_deploy)
-        order = topological_order(self.profile, selected)
-        results: list[dict[str, Any]] = []
-        selected_set = set(selected)
-        for name in order:
-            stage = self.profile.stages[name]
-            if stage.kind == "deploy":
-                if deploy and name in selected_set and stage.target == selected_target:
-                    results.append(self._execute_stage(stage, target=selected_target, force=True))
-                else:
-                    # 依赖可以使用先前部署记录，但 release 永远不会自动运行未选定的部署阶段。
-                    self._require_cached(name, stage.target or selected_target)
-                continue
-            if selected_target and stage.target and stage.target != selected_target:
-                self._require_cached(name, stage.target)
-                continue
-            if name not in selected_set:
-                self._require_cached(name, selected_target)
-                continue
-            if stage.kind not in {"build", "test", "validate"}:
-                raise FlowError("FLOW-STAGE-KIND", f"release 阶段 kind {stage.kind!r} 不受支持")
-            results.append(self._execute_stage(stage, target=selected_target, force=force))
-        return {"status": "succeeded", "operation": "release", "project": self.profile.project_name,
-                "target": selected_target, "deploy_requested": deploy,
-                "deploy_stage": matching_deploy[0] if matching_deploy else None, "stages": results}
-    def doctor(self, *, target: str | None = None) -> dict[str, Any]:
-        selected_target = self._target(target)
-        run_id = _new_run_id()
-        run_dir = self.store.run_path(run_id).parent
-        run_dir.mkdir(parents=True, exist_ok=False)
-        started = utc_now()
-        versions, details, okay = self._probe_all_toolchains(run_dir)
-        completed = utc_now()
-        record: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
-            "stage": "doctor",
-            "status": "succeeded" if okay else "failed",
-            "target": selected_target,
-            "tool_versions": versions,
-            "toolchain_details": details,
-            "inputs": {},
-            "dependencies": {},
-            "outputs": {},
-            "command": [],
-            "started_at_utc": started,
-            "completed_at_utc": completed,
-        }
-        _write_json(run_dir / "command.json", {"action": "doctor", "target": selected_target})
-        _write_json(run_dir / "execution.json", {"succeeded": okay, "started_at_utc": started,
-                                                   "completed_at_utc": completed})
-        (run_dir / "stdout.log").write_text(json.dumps(details, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        (run_dir / "stderr.log").write_text("" if okay else "一个或多个工具链探测未通过。\n", encoding="utf-8")
-        record["evidence"] = _evidence_hashes(self.profile.root, run_dir)
-        self.store.record_run(run_id, "doctor", record)
-        return {"run_id": run_id, **record}
+                allow_side_effects: bool = False, force: bool = False,
+                wait_lock: bool = False) -> dict[str, Any]:
+        with self._mutation_guard("release", wait_lock=wait_lock):
+            selected_target = self._target(target)
+            if deploy_stage is not None and not deploy:
+                raise FlowError("FLOW-RELEASE-DEPLOY-OPTIN", "--deploy-stage 必须与显式的 --deploy 一起使用")
+            if deploy and selected_target is None:
+                raise FlowError("FLOW-TARGET-REQUIRED", "release --deploy 必须指定 --target")
+            matching_deploy = self._select_deploy_stages(selected_target, deploy_stage) if deploy and selected_target else []
+            if deploy:
+                self._check_destructive(matching_deploy, allow_destructive)
+            selected = [name for name, stage in self.profile.stages.items()
+                        if stage.kind in {"build", "test", "validate"}
+                        and (selected_target is None or stage.target is None or stage.target == selected_target)]
+            if deploy:
+                selected.extend(matching_deploy)
+            self._check_side_effects(selected, allow_side_effects)
+            order = topological_order(self.profile, selected)
+            deployment_names = set(matching_deploy)
 
-    def plan(self, *, target: str | None = None) -> dict[str, Any]:
+            def depends_on_deployment(name: str) -> bool:
+                pending = list(self.profile.stages[name].needs)
+                visited: set[str] = set()
+                while pending:
+                    dependency = pending.pop()
+                    if dependency in deployment_names:
+                        return True
+                    if dependency not in visited:
+                        visited.add(dependency)
+                        pending.extend(self.profile.stages[dependency].needs)
+                return False
+
+            barrier = {
+                name for name in selected
+                if self.profile.stages[name].kind in {"build", "test", "validate"}
+                and not depends_on_deployment(name)
+            }
+            results = self._execute_schedule(
+                order, selected, target=selected_target, force=force,
+                allow_side_effects=allow_side_effects, deploy_barrier=barrier if deploy else set(),
+            )
+            return {"status": "succeeded", "operation": "release", "project": self.profile.project_name,
+                    "target": selected_target, "deploy_requested": deploy,
+                    "deploy_stage": matching_deploy[0] if matching_deploy else None, "stages": results}
+
+    def _scope_stages(self, *, target: str | None = None, stage: str | None = None,
+                      suite: str | None = None, include_deploy_by_default: bool = True
+                      ) -> tuple[str | None, list[str], list[str]]:
+        if stage is not None and suite is not None:
+            raise FlowError("FLOW-SCOPE-CONFLICT", "stage 与 suite 不能同时指定")
         selected_target = self._target(target)
+        if stage is not None:
+            if stage not in self.profile.stages:
+                raise FlowError("FLOW-STAGE-UNKNOWN", f"未知阶段：{stage}")
+            requested = [stage]
+        elif suite is not None:
+            if suite not in self.profile.suites:
+                raise FlowError("FLOW-SUITE-UNKNOWN", f"未知验证套件 {suite!r}")
+            requested = list(self.profile.suites[suite])
+        else:
+            requested = [
+                name for name, item in self.profile.stages.items()
+                if include_deploy_by_default or item.kind != "deploy"
+            ]
+        for name in requested:
+            item = self.profile.stages[name]
+            if selected_target and item.target and item.target != selected_target:
+                raise FlowError("FLOW-TARGET-MISMATCH",
+                                f"阶段 {name!r} 固定使用目标 {item.target!r}")
+        order = topological_order(self.profile, requested) if requested else []
+        return selected_target, requested, order
+
+    def _config_argument(self) -> str:
+        try:
+            return self.profile.config_path.relative_to(self.profile.root).as_posix()
+        except ValueError:
+            return str(self.profile.config_path)
+
+    @staticmethod
+    def _command_text(argv: Sequence[str]) -> str:
+        return subprocess.list2cmdline(list(argv)) if os.name == "nt" else shlex.join(list(argv))
+
+    def _cli_argv(self, action: str, *arguments: str) -> list[str]:
+        return ["fpga-flow", "--config", self._config_argument(), action, *arguments]
+
+    def _stage_action(self, stage: StageConfig, *, target: str | None,
+                      suite: str | None = None, with_deps: bool = False) -> list[str] | None:
+        if stage.kind == "build":
+            args = ["--stage", stage.name]
+            affected = topological_order(self.profile, [stage.name]) if with_deps else [stage.name]
+            if with_deps:
+                args.append("--with-deps")
+            action = "build"
+        elif stage.kind in {"test", "validate"}:
+            matching = [name for name, names in self.profile.suites.items() if stage.name in names]
+            selected_suite = suite if suite in matching else (matching[0] if matching else None)
+            if selected_suite is None:
+                return None
+            args = ["--suite", selected_suite]
+            affected = list(self.profile.suites[selected_suite])
+            action = "validate"
+        elif stage.kind == "deploy":
+            selected = self._select_deploy_stages(target or stage.target or "", stage.name)
+            args = ["--target", target or stage.target or "", "--stage", selected[0]]
+            affected = [stage.name]
+            if stage.destructive:
+                args.append("--allow-destructive")
+            action = "deploy"
+        else:
+            return None
+        selected_target = target or stage.target
+        if selected_target and "--target" not in args:
+            args.extend(["--target", selected_target])
+        if any(self.profile.stages[name].side_effects for name in affected):
+            args.append("--allow-side-effects")
+        return self._cli_argv(action, *args)
+
+    def _file_tail(self, path: Path, count: int) -> list[str]:
+        if count <= 0:
+            return []
+        try:
+            from collections import deque
+            with path.open("r", encoding="utf-8", errors="replace") as stream:
+                return [line.rstrip("\r\n") for line in deque(stream, maxlen=count)]
+        except OSError:
+            return []
+
+    def doctor(self, *, target: str | None = None, stage: str | None = None,
+               suite: str | None = None, wait_lock: bool = False) -> dict[str, Any]:
+        selected_target, requested, _ = self._scope_stages(
+            target=target, stage=stage, suite=suite, include_deploy_by_default=True
+        )
+        scope_names = requested if stage is not None or suite is not None else [
+            name for name, item in self.profile.stages.items()
+            if selected_target is None or item.target is None or item.target == selected_target
+        ]
+        toolchain_names = list(dict.fromkeys(
+            toolchain for name in scope_names for toolchain in self.profile.stages[name].toolchains
+        ))
+        if not scope_names and stage is None and suite is None and selected_target is None:
+            toolchain_names = list(self.profile.toolchains)
+
+        with self._mutation_guard("doctor", wait_lock=wait_lock):
+            run_id = _new_run_id()
+            run_dir = self.store.run_path(run_id).parent
+            run_dir.mkdir(parents=True, exist_ok=False)
+            if self._active_run_lock is not None:
+                self._active_run_lock.set_run(run_id)
+            started = utc_now()
+            self._notify({"event": "doctor_started", "run_id": run_id, "target": selected_target})
+            versions, details, okay = self._probe_all_toolchains(run_dir, toolchain_names)
+            preflight: dict[str, dict[str, Any]] = {}
+            warnings: list[str] = []
+            for name in scope_names:
+                item = self.profile.stages[name]
+                runner = _runner_name(item)
+                if runner == "command":
+                    continue
+                provider = self.providers.get(runner)
+                probe = getattr(provider, "preflight", None) if provider is not None else None
+                if not callable(probe):
+                    preflight[name] = {"status": "not_probed", "runner": runner,
+                                       "detail": "provider 未提供只读预检"}
+                    continue
+                stage_target = item.target or selected_target
+                try:
+                    preflight_run_id = f"doctor-{run_id}"
+                    with self._stage_target_lock(item, stage_target, preflight_run_id):
+                        result = dict(probe(item, self.profile, run_dir / "preflight" / name, stage_target))
+                    probe_status = str(result.get("status", "ok"))
+                    preflight[name] = {"status": probe_status, "runner": runner, "result": result}
+                    if probe_status == "warning":
+                        warnings.append(f"{name}: {result.get('detail', '预检警告')}")
+                    elif probe_status != "ok":
+                        okay = False
+                except Exception as exc:
+                    preflight[name] = {"status": "failed", "runner": runner,
+                                       "error": f"{type(exc).__name__}: {exc}"}
+                    okay = False
+
+            toolchain_warnings = [name for name, value in details.items()
+                                  if value.get("status") == "warning"]
+            warnings.extend(f"{name}: {details[name].get('detail')}" for name in toolchain_warnings)
+            status = "failed" if not okay else ("warning" if warnings else "succeeded")
+            completed = utc_now()
+            record: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION, "stage": "doctor", "status": status,
+                "target": selected_target, "scope": {"stage": stage, "suite": suite},
+                "selected_stages": scope_names, "tool_versions": versions,
+                "toolchain_details": details, "preflight_details": preflight,
+                "warnings": warnings, "inputs": {}, "dependencies": {}, "outputs": {},
+                "command": [], "started_at_utc": started, "completed_at_utc": completed,
+            }
+            _write_json(run_dir / "command.json", {"action": "doctor", "target": selected_target,
+                                                    "stage": stage, "suite": suite})
+            _write_json(run_dir / "execution.json", {"succeeded": okay, "started_at_utc": started,
+                                                       "completed_at_utc": completed})
+            (run_dir / "stdout.log").write_text(json.dumps(
+                {"toolchains": details, "preflight": preflight}, ensure_ascii=False, indent=2
+            ) + "\n", encoding="utf-8")
+            (run_dir / "stderr.log").write_text("\n".join(warnings) + ("\n" if warnings else ""),
+                                                encoding="utf-8")
+            record["evidence"] = _evidence_hashes(self.profile.root, run_dir)
+            self.store.record_run(run_id, "doctor", record)
+            self._notify({"event": "doctor_finished", "run_id": run_id, "status": status})
+            return {"run_id": run_id, **record}
+
+    def plan(self, *, target: str | None = None, stage: str | None = None,
+             suite: str | None = None) -> dict[str, Any]:
+        selected_target, requested, order = self._scope_stages(
+            target=target, stage=stage, suite=suite, include_deploy_by_default=True
+        )
         manifest = self.store.load()
         memo: dict[tuple[str, str | None], tuple[bool, str, Mapping[str, Any] | None]] = {}
         rows: list[dict[str, Any]] = []
-        for name, stage in self.profile.stages.items():
-            row: dict[str, Any] = {"stage": name, "kind": stage.kind, "runner": _runner_name(stage),
-                                   "target": stage.target, "needs": list(stage.needs)}
+        for name in order:
+            item = self.profile.stages[name]
+            summary = manifest.get("stages", {}).get(name, {})
+            last_elapsed = summary.get("elapsed_seconds") if isinstance(summary, Mapping) else None
+            row: dict[str, Any] = {
+                "stage": name, "kind": item.kind, "runner": _runner_name(item),
+                "target": item.target, "needs": list(item.needs),
+                "toolchains": list(item.toolchains), "resources": list(item.resources),
+                "side_effects": list(item.side_effects),
+                "requires_side_effect_ack": bool(item.side_effects),
+                "description": item.description, "timeout_seconds": item.timeout_seconds,
+                "last_run_id": summary.get("run_id") if isinstance(summary, Mapping) else None,
+                "last_status": summary.get("status") if isinstance(summary, Mapping) else None,
+                "last_success_run_id": (summary.get("last_success_run_id") or (summary.get("run_id") if summary.get("status") == "succeeded" else None)) if isinstance(summary, Mapping) else None,
+                "last_elapsed_seconds": last_elapsed,
+            }
             try:
-                self._check_runner(stage)
+                self._check_runner(item)
             except FlowError as exc:
-                row.update({"action": "blocked", "status": "fail", "detail": f"{exc.code}: {exc}"})
+                row.update({"action": "blocked", "status": "fail",
+                            "detail": f"{exc.code}: {exc}"})
                 rows.append(row)
                 continue
-            if stage.kind == "deploy":
-                if selected_target is None:
-                    row.update({"action": "explicit-deploy-only", "status": "blocked",
-                                "detail": "需要 deploy --target；plan 不会执行部署"})
-                elif stage.target != selected_target:
+            if item.kind == "deploy":
+                if item.target and selected_target and item.target != selected_target:
                     row.update({"action": "skip-target", "status": "not-selected",
-                                "detail": f"阶段目标为 {stage.target!r}"})
-                else:
+                                "detail": f"阶段固定使用目标 {item.target!r}"})
+                elif stage == name:
                     row.update({"action": "deploy", "status": "explicit-only",
-                                "detail": "请显式部署此目标；部署阶段不会被缓存跳过"})
+                                "detail": "需显式选择该部署阶段"})
+                else:
+                    row.update({"action": "explicit-deploy-only", "status": "blocked",
+                                "detail": "部署阶段不会由 plan 或 release 自动执行"})
                 rows.append(row)
                 continue
-            if stage.target and selected_target and stage.target != selected_target:
-                row.update({"action": "skip-target", "status": "not-selected",
-                            "detail": f"阶段固定使用目标 {stage.target!r}"})
-                rows.append(row)
-                continue
-            if stage.kind == "validate":
+            if item.kind == "validate":
                 row.update({"action": "validate", "status": "explicit-only",
-                            "detail": "板级/运行时验证在每次显式请求时都会重新执行"})
+                            "detail": "验证阶段每次显式请求都会重新运行"})
                 rows.append(row)
                 continue
             try:
                 valid, detail, record = self._cache_state(name, manifest, memo, set(), selected_target)
                 evidence = _evidence_status(self.profile.root, record, self.store) if record else "missing"
+                command = list(item.command)
+                if _runner_name(item) == "command" and item.command:
+                    fields = {"root": str(self.profile.root), "out_dir": str(self.profile.output_dir),
+                              "run_dir": "<run_dir>", "target": selected_target or ""}
+                    command = list(_format_argv(item.command, fields))
                 if valid:
                     row.update({"action": "cache-hit", "status": "succeeded", "detail": detail,
                                 "run_id": record.get("run_id") if record else None, "evidence": evidence})
                 else:
-                    row.update({"action": "run", "status": "pending", "detail": detail, "evidence": evidence})
+                    row.update({"action": "run", "status": "pending", "detail": detail,
+                                "evidence": evidence, "command_argv": command})
             except FlowError as exc:
                 row.update({"action": "blocked", "status": "fail", "detail": f"{exc.code}: {exc}"})
             rows.append(row)
-        return {"status": "ready", "project": self.profile.project_name, "target": selected_target,
-                "commands_launched": False, "stages": rows}
+        return {
+            "status": "ready", "project": self.profile.project_name, "target": selected_target,
+            "scope": {"stage": stage, "suite": suite}, "commands_launched": False,
+            "max_parallel_stages": self.profile.max_parallel_stages, "stages": rows,
+        }
 
-    def status(self, *, target: str | None = None) -> dict[str, Any]:
+    def status(self, *, target: str | None = None, stage: str | None = None,
+               suite: str | None = None) -> dict[str, Any]:
         manifest = self.store.load()
-        plan = self.plan(target=target)
+        plan = self.plan(target=target, stage=stage, suite=suite)
         stage_records = manifest.get("stages", {})
         rows: list[dict[str, Any]] = []
         for row in plan["stages"]:
-            previous = stage_records.get(row["stage"], {}) if isinstance(stage_records, Mapping) else {}
+            summary = stage_records.get(row["stage"], {}) if isinstance(stage_records, Mapping) else {}
+            try:
+                previous = self.store.stage_record(manifest, row["stage"]) or summary
+            except ManifestError:
+                previous = summary
             rows.append({**row,
-                         "last_status": previous.get("status") if isinstance(previous, Mapping) else None,
-                         "last_run_id": previous.get("run_id") if isinstance(previous, Mapping) else None,
+                         "last_status": summary.get("status") if isinstance(summary, Mapping) else None,
+                         "last_run_id": summary.get("run_id") if isinstance(summary, Mapping) else None,
                          "last_error": previous.get("error") if isinstance(previous, Mapping) else None,
+                         "last_success_run_id": (summary.get("last_success_run_id") or (summary.get("run_id") if summary.get("status") == "succeeded" else None)) if isinstance(summary, Mapping) else None,
                          "last_evidence": _evidence_status(self.profile.root, previous, self.store)
                          if isinstance(previous, Mapping) else "missing"})
-        return {"status": "ok", "project": self.profile.project_name, "target": plan["target"],
-                "latest_run_id": manifest.get("latest_run_id"), "run_ids": list(manifest.get("run_ids", [])),
-                "stages": rows}
+        run_ids = list(manifest.get("run_ids", []))
+        return {
+            "status": "ok", "project": self.profile.project_name, "target": plan["target"],
+            "latest_run_id": manifest.get("latest_run_id"), "run_count": manifest.get("run_count", len(run_ids)),
+            "recent_run_ids": run_ids[-10:], "stages": rows,
+        }
 
-    def resume(self) -> dict[str, Any]:
+    def resume(self, *, target: str | None = None, stage: str | None = None,
+               suite: str | None = None) -> dict[str, Any]:
+        selected_target, requested, order = self._scope_stages(
+            target=target, stage=stage, suite=suite, include_deploy_by_default=False
+        )
         manifest = self.store.load()
+        plan = self.plan(target=selected_target, stage=stage, suite=suite)
+        row_by_name = {row["stage"]: row for row in plan["stages"]}
         stage_records = manifest.get("stages", {})
-        if not isinstance(stage_records, Mapping):
-            raise FlowError("FLOW-MANIFEST", "manifest 的 stages 表格式无效")
-        unfinished: list[dict[str, Any]] = []
-        for name, record in stage_records.items():
-            if not isinstance(record, Mapping) or record.get("status") not in {"running", "failed"}:
+        if stage is not None or suite is not None:
+            failure_order = order
+        else:
+            failure_order = [
+                name for name, item in self.profile.stages.items()
+                if selected_target is None or item.target is None or item.target == selected_target
+            ]
+        for name in failure_order:
+            summary = stage_records.get(name, {}) if isinstance(stage_records, Mapping) else {}
+            if not isinstance(summary, Mapping) or summary.get("status") not in {"running", "failed"}:
                 continue
-            run_id = record.get("run_id")
-            log_dir = None
-            if isinstance(run_id, str):
-                try:
-                    log_dir = str(self.store.run_path(run_id).parent)
-                except ManifestError:
-                    pass
-            stage = self.profile.stages.get(name)
-            suggestion = None
-            if stage is not None:
-                if stage.kind == "deploy":
-                    suggestion = f"fpga-flow deploy --target {stage.target or '<target>'}"
-                elif stage.kind == "build":
-                    suggestion = f"fpga-flow build --stage {name}"
-                else:
-                    suite = next((suite_name for suite_name, names in self.profile.suites.items() if name in names), None)
-                    if suite:
-                        suggestion = f"fpga-flow validate --suite {suite}"
-            unfinished.append({"stage": name, "status": record.get("status"), "run_id": run_id,
-                               "error": record.get("error"), "log_dir": log_dir,
-                               "evidence": _evidence_status(self.profile.root, record, self.store),
-                               "suggested_command": suggestion})
-        return {"status": "needs-attention" if unfinished else "ready",
-                "project": self.profile.project_name, "latest_run_id": manifest.get("latest_run_id"),
-                "unfinished_or_failed": unfinished,
-                "next": "检查运行日志后重新查看计划" if unfinished else "运行 plan 查看当前缓存状态"}
+            run_id = summary.get("run_id")
+            command = self._cli_argv("watch", "--run-id", str(run_id), "--tail-lines", "80")
+            return {
+                "status": "needs-attention", "project": self.profile.project_name,
+                "target": selected_target, "latest_run_id": manifest.get("latest_run_id"),
+                "next_action": {"kind": "inspect-run", "stage": name, "run_id": run_id,
+                                "reason": summary.get("error") or "阶段运行尚未完成",
+                                "argv": command, "command": self._command_text(command)},
+            }
+        plan_rows = row_by_name
+        if stage is None and suite is None:
+            requested = [name for name in order if self.profile.stages[name].kind != "deploy"]
+        for name in order:
+            if name not in plan_rows:
+                continue
+            row = plan_rows[name]
+            item = self.profile.stages[name]
+            action = row.get("action")
+            if action == "cache-hit" or action == "skip-target":
+                continue
+            if action == "blocked" and item.kind != "deploy":
+                return {
+                    "status": "needs-attention", "project": self.profile.project_name,
+                    "target": selected_target, "latest_run_id": manifest.get("latest_run_id"),
+                    "next_action": {"kind": "blocked", "stage": name, "reason": row.get("detail")},
+                }
+            if item.kind == "deploy":
+                if stage != name:
+                    required = any(name in topological_order(self.profile, [requested_name])[1:]
+                                   for requested_name in requested)
+                    if not required:
+                        continue
+                if stage != name:
+                    valid_deploy, _, _ = self._cache_state(
+                        name, manifest=manifest, target=item.target or selected_target
+                    )
+                    if valid_deploy:
+                        continue
+                argv = self._stage_action(item, target=selected_target)
+            elif item.kind in {"test", "validate"}:
+                matching_suites = [key for key, names in self.profile.suites.items() if name in names]
+                chosen_suite = suite if suite in matching_suites else (matching_suites[0] if matching_suites else None)
+                if chosen_suite is None:
+                    return {
+                        "status": "needs-attention", "project": self.profile.project_name,
+                        "target": selected_target, "latest_run_id": manifest.get("latest_run_id"),
+                        "next_action": {"kind": "blocked", "stage": name,
+                                        "reason": "阶段未加入任何验证套件"},
+                    }
+                argv = self._stage_action(item, target=selected_target, suite=chosen_suite)
+            else:
+                dependency_stale = any(
+                    not self._cache_state(dep, manifest=manifest, target=self.profile.stages[dep].target or selected_target)[0]
+                    for dep in item.needs if self.profile.stages[dep].kind != "deploy"
+                )
+                argv = self._stage_action(item, target=selected_target, with_deps=dependency_stale)
+            if argv is None:
+                continue
+            return {
+                "status": "pending", "project": self.profile.project_name,
+                "target": selected_target, "latest_run_id": manifest.get("latest_run_id"),
+                "next_action": {"kind": action, "stage": name, "reason": row.get("detail"),
+                                "side_effects": list(item.side_effects),
+                                "argv": argv, "command": self._command_text(argv)},
+            }
+        return {
+            "status": "ready", "project": self.profile.project_name,
+            "target": selected_target, "latest_run_id": manifest.get("latest_run_id"),
+            "next_action": None, "detail": "所选范围没有待执行阶段",
+        }
+
+    def watch(self, run_id: str, *, tail_lines: int = 40) -> dict[str, Any]:
+        if type(tail_lines) is not int or not 0 <= tail_lines <= 500:
+            raise FlowError("FLOW-WATCH-TAIL", "tail_lines 必须是 0 到 500 之间的整数")
+        try:
+            record_path = self.store.run_path(run_id)
+        except ManifestError as exc:
+            raise FlowError("FLOW-RUN-ID", str(exc)) from exc
+        run_dir = record_path.parent
+        if not run_dir.is_dir():
+            raise FlowError("FLOW-RUN-NOT-FOUND", f"没有找到 run_id={run_id}")
+        record = None
+        if record_path.is_file():
+            try:
+                record = self.store.read_run_record(run_id)
+            except ManifestError:
+                record = None
+        execution: dict[str, Any] = {}
+        execution_path = run_dir / "execution.json"
+        if execution_path.is_file():
+            try:
+                value = json.loads(execution_path.read_text(encoding="utf-8"))
+                execution = value if isinstance(value, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                execution = {}
+        summary = None
+        manifest = self.store.load()
+        for value in manifest.get("stages", {}).values():
+            if isinstance(value, Mapping) and value.get("run_id") == run_id:
+                summary = value
+                break
+        status = record.get("status") if isinstance(record, Mapping) else None
+        status = status or execution.get("state") or (summary.get("status") if isinstance(summary, Mapping) else "unknown")
+        log_files = []
+        for path in sorted(run_dir.rglob("*.log"), key=lambda p: p.stat().st_mtime):
+            relative = path.relative_to(run_dir).as_posix()
+            log_files.append({"path": relative, "tail": self._file_tail(path, tail_lines)})
+        return {
+            "status": status, "run_id": run_id,
+            "stage": (record or summary or {}).get("stage"),
+            "target": (record or summary or {}).get("target"),
+            "started_at_utc": (record or {}).get("started_at_utc") or execution.get("started_at_utc"),
+            "completed_at_utc": (record or {}).get("completed_at_utc") if isinstance(record, Mapping) else None,
+            "error_code": (record or {}).get("error_code") if isinstance(record, Mapping) else None,
+            "error": (record or {}).get("error") if isinstance(record, Mapping) else None,
+            "execution": execution, "logs": log_files,
+        }
+
+    def history(self, *, limit: int = 20, before_run_id: str | None = None,
+                stage: str | None = None) -> dict[str, Any]:
+        try:
+            records = self.store.list_runs(limit=limit, before_run_id=before_run_id, stage=stage)
+        except ManifestError as exc:
+            raise FlowError("FLOW-HISTORY", str(exc)) from exc
+        summaries = [{
+            "run_id": item.get("run_id"), "stage": item.get("stage"), "kind": item.get("kind"),
+            "status": item.get("status"), "target": item.get("target"),
+            "started_at_utc": item.get("started_at_utc"),
+            "completed_at_utc": item.get("completed_at_utc"),
+            "elapsed_seconds": item.get("elapsed_seconds"),
+            "error_code": item.get("error_code"), "error": item.get("error"),
+        } for item in records]
+        return {"status": "ok", "project": self.profile.project_name,
+                "count": len(summaries), "stage_filter": stage, "runs": summaries}

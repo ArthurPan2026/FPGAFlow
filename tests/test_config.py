@@ -160,6 +160,28 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(profile.stages["hardware"].command[:2], ("python3", "scripts/build_hw.py"))
         self.assertEqual(profile.stages["board_smoke"].cwd, profile.root)
 
+    def test_optional_parallelism_resources_and_side_effects_are_project_profile_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = NON_HLS_PROFILE.replace(
+                "[flow]",
+                "[flow]\nmax_parallel_stages = 2",
+                1,
+            ).replace(
+                "[stages.hardware]",
+                '[stages.hardware]\nresources = ["shared-vivado-workspace"]\nside_effects = ["persistent-storage"]',
+                1,
+            )
+            config = root / "fpga-flow.toml"
+            config.write_text(source, encoding="utf-8")
+            profile = load_profile(config)
+            self.assertEqual(profile.max_parallel_stages, 2)
+            self.assertEqual(profile.stages["hardware"].resources, ("shared-vivado-workspace",))
+            self.assertEqual(profile.stages["hardware"].side_effects, ("persistent-storage",))
+            default_profile = root / "default.toml"
+            default_profile.write_text(NON_HLS_PROFILE, encoding="utf-8")
+            self.assertEqual(load_profile(default_profile).max_parallel_stages, 1)
+
     def test_optional_hls_stages_are_supported_without_special_cases(self) -> None:
         profile = self._load_text(HLS_PROFILE)
         self.assertEqual(

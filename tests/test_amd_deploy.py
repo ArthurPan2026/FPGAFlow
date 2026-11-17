@@ -10,6 +10,7 @@ from fpga_flow.amd_deploy import (
     parse_program_flash_targets,
     program_flash_query_argv,
     render_zynq_jtag_program_tcl,
+    render_zynq_jtag_probe_tcl,
     select_unique_flash_target,
 )
 
@@ -45,6 +46,18 @@ class AmdDeployHelpersTests(unittest.TestCase):
         with self.assertRaises(DeployCommandError):
             build_qspi_program_argv("p", "b", "f", flash_type="qspi", offset=-1,
                                     target_name="board", server_url="tcp:localhost:3121")
+
+    def test_jtag_preflight_script_only_queries_targets(self) -> None:
+        script = render_zynq_jtag_probe_tcl(
+            hw_server_url="tcp:localhost:3121", ps_target_pattern="APU",
+            pl_target_pattern="xc7z020*", cpu_target_pattern="ARM Cortex-A9*",
+        )
+        self.assertIn("connect -url", script)
+        self.assertIn("PREFLIGHT_TARGET_OK", script)
+        self.assertIn("PREFLIGHT_READ_ONLY", script)
+        self.assertNotIn("rst -", script)
+        self.assertNotIn("fpga ", script)
+        self.assertNotIn("dow ", script)
 
     def test_jtag_script_is_profile_parameterized_and_quotes_paths_with_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

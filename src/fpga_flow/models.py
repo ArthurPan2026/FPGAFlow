@@ -13,6 +13,7 @@ class ToolchainConfig:
     version_args: tuple[str, ...]
     expected_version: str | None = None
     version_command: tuple[str, ...] | None = None
+    failure_markers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,8 @@ class StageConfig:
     timeout_seconds: int | None = None
     success_markers: tuple[str, ...] = ()
     failure_markers: tuple[str, ...] = ()
+    side_effects: tuple[str, ...] = ()
+    resources: tuple[str, ...] = ()
     target: str | None = None
     destructive: bool = False
     description: str = ""
@@ -48,3 +51,4 @@ class FlowConfig:
     targets: Mapping[str, Mapping[str, Any]]
     stages: Mapping[str, StageConfig]
     suites: Mapping[str, tuple[str, ...]]
+    max_parallel_stages: int = 1

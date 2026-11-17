@@ -1,35 +1,36 @@
 ---
 name: fpga-flow
-description: 使用 fpga-flow 在 AMD Vivado/Vitis 项目中执行可重复的构建、验证、部署，或在智能体会话中断后恢复工作。
+description: 使用 fpga-flow 在 AMD Vivado/Vitis 工程中执行可重复的构建、验证、部署，或在智能体会话中断后恢复工作。
 ---
 
-# FPGA Flow 操作指南
+# FPGAFlow Agent 操作指南
 
-对已配置的项目，始终以 fpga-flow CLI 作为正式入口。读取项目自己的 fpga-flow.toml；涉及 AMD 工具细节或需要交互式检查 Vivado 时，查询 AMD Ross 文档或使用相应 MCP 能力。
+对已配置的工程，使用消费项目自己的 `fpga-flow.toml` 和 FPGAFlow CLI。不要把项目路径、板卡规则或命令复制到 FPGAFlow 核心。
 
-## 上下文变化后恢复
+## 恢复上下文
 
-1. 运行 fpga-flow status --json 和 fpga-flow resume --json。
-2. 阅读中断阶段的最新运行记录及日志路径。
-3. 运行 fpga-flow doctor 和 fpga-flow plan，再决定下一步构建操作。
-4. 每次只继续一个阶段，并使用配置文件中声明的输入和输出。
+1. 先运行 `fpga-flow resume --config fpga-flow.toml --json`。
+2. 如果有活动 run，按返回的命令运行 `watch`；如果有失败 run，先查看日志尾部。
+3. 按 resume 返回的下一步命令继续。resume 只给建议，不会执行命令。
+4. 需要重新核对环境时，按目标阶段运行 `doctor --stage <name>` 或 `doctor --suite <name>`。
 
-manifest、运行记录和产物保存实际操作状态；不要依靠对话历史或 shell 历史重建步骤。
+manifest 和不可变 run 记录保存实际状态。不要依靠聊天历史或 shell 历史重建部署步骤。
 
 ## 构建与验证
 
-- 保持 plan 为只读操作。它不得启动 Vivado/Vitis、探测板卡或写入产物。
-- 使用 build --stage <name> 执行单个阶段。只有用户要求同时运行前置阶段时才使用 --with-deps。
-- 严格按 profile 中声明的内容运行主机测试和 RTL 套件。保留套件名称、随机种子、工具版本、日志和通过标记。
-- 分别报告主机、RTL、UART、读回和画面证据。
+- 使用 `plan` 检查缓存、依赖、工具链、输出和所需授权。plan 是只读命令。
+- 使用 `build --stage <name>` 执行一个阶段。只有明确需要运行前置阶段时才加 `--with-deps`。
+- Profile 默认串行。Profile 提高并行上限时，先声明共享 Vivado/Vitis、目标板和输出资源的锁。
+- UART 期望文本使用 `expect_text`；需要正则时使用 `expect`。通信超时会停止后续步骤。只有 profile 明确允许时，断言失败才继续采集诊断。
+- 汇报主机、RTL、UART、QSPI 读回和画面证据的边界。
 
-## 板卡操作
+## 板卡与副作用
 
-- 部署前检查所选目标与 profile 一致，并确认所需产物哈希有效。
-- 只有用户明确要求写入板卡时才使用 deploy --target <profile-target>。有破坏性的阶段，仅在用户已授权时传入所需的显式授权标记。
-- 不终止占用 UART 或编程器会话的进程。报告占用情况并选择安全方案。
+- 部署前查看目标和产物状态。目标有多种部署方式时，明确选择 `--stage`。
+- 只有得到用户授权后才运行 `deploy`。配置了外部副作用的阶段还需要 `--allow-side-effects`；破坏性部署需要 `--allow-destructive`。
+- 不终止占用串口或编程器的外部进程。先读取锁持有者和诊断日志。
 - 不得根据 UART 或仿真数据声称画面验收通过。
 
-## 输出
+## 运行报告
 
-自动续作时优先使用 CLI 的 JSON 输出。总结 run_id、阶段状态、产物哈希和下一步有效操作，使其他智能体能够继续工作，而不必重新探索工具链。
+自动续作时优先使用 JSON 输出。默认结果包含项目、target、run_id、阶段状态、缓存原因和输入/输出/证据数量；需要核对具体哈希时再加 `--details`，完整记录保存在 run 目录。查看长任务时使用 `watch`，不要重复启动同一阶段。

@@ -98,6 +98,42 @@ def _tcl_list(values: Iterable[str]) -> str:
     return "[list " + " ".join(tcl_quote(value) for value in values) + "]"
 
 
+
+def render_zynq_jtag_probe_tcl(
+    *, hw_server_url: str, ps_target_pattern: str, pl_target_pattern: str,
+    cpu_target_pattern: str,
+) -> str:
+    """生成只查询 JTAG 目标的 Tcl，不复位或配置器件。"""
+    values = {
+        "hw_server_url": hw_server_url,
+        "ps_target_pattern": ps_target_pattern,
+        "pl_target_pattern": pl_target_pattern,
+        "cpu_target_pattern": cpu_target_pattern,
+    }
+    if any(not isinstance(value, str) or not value.strip() for value in values.values()):
+        raise DeployCommandError("JTAG 预检需要 hw_server URL 和三个目标匹配模式")
+    return f'''proc check_unique_target {{pattern label}} {{
+    set matches {{}}
+    foreach properties [targets -target-properties] {{
+        if {{[string match $pattern [dict get $properties name]]}} {{
+            lappend matches $properties
+        }}
+    }}
+    if {{[llength $matches] != 1}} {{
+        error "$label 目标必须恰好匹配一个目标；pattern={{$pattern}} matches=$matches"
+    }}
+    set properties [lindex $matches 0]
+    puts "PREFLIGHT_TARGET_OK $label id=[dict get $properties target_id] name=[dict get $properties name]"
+}}
+connect -url {tcl_quote(hw_server_url)}
+check_unique_target {tcl_quote(ps_target_pattern)} PS
+check_unique_target {tcl_quote(pl_target_pattern)} PL
+check_unique_target {tcl_quote(cpu_target_pattern)} CPU
+disconnect
+puts "PREFLIGHT_READ_ONLY"
+exit
+'''
+
 def render_zynq_jtag_program_tcl(
     bitstream: str | Path,
     ps_init_script: str | Path,

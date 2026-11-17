@@ -39,6 +39,10 @@
         "default_target": {
           "type": "string",
           "minLength": 1
+        },
+        "max_parallel_stages": {
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
@@ -117,6 +121,12 @@
             "type": "string",
             "minLength": 1
           }
+        },
+        "failure_markers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -189,6 +199,22 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "side_effects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "resources": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
           }
         },
         "target": {

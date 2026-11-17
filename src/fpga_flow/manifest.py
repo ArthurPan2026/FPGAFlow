@@ -1,21 +1,26 @@
-"""FPGA Flow 的原子化 manifest 和不可变运行记录。
-
-manifest 保存各阶段的最新状态索引。详细运行记录
-以不可变文件保存，Agent 可在上下文丢失后据此恢复。
-"""
+"""项目状态索引与不可变运行记录。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _STAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_RECENT_RUN_LIMIT = 50
+_SUMMARY_KEYS = (
+    "stage", "kind", "status", "target", "run_id", "fingerprint", "cache_hit",
+    "started_at_utc", "completed_at_utc", "elapsed_seconds", "error_code", "error",
+    "tool_versions", "last_success_run_id",
+)
 
 
 class ManifestError(ValueError):
@@ -73,7 +78,6 @@ def _atomic_write(path: Path, contents: bytes, *, replace: bool) -> None:
         if replace:
             os.replace(temp_path, path)
         else:
-            # 硬链接创建是原子的；若不可变目标已存在，操作会失败。
             os.link(temp_path, path)
             temp_path.unlink()
         try:
@@ -92,8 +96,16 @@ def _atomic_write(path: Path, contents: bytes, *, replace: bool) -> None:
             pass
 
 
+def _stage_summary(record: Mapping[str, Any]) -> dict[str, Any]:
+    summary = {key: record[key] for key in _SUMMARY_KEYS if key in record}
+    for source, target in (("inputs", "input_count"), ("outputs", "output_count"), ("evidence", "evidence_count")):
+        value = record.get(source, {})
+        summary[target] = len(value) if isinstance(value, Mapping) else 0
+    return summary
+
+
 class ManifestStore:
-    """项目内的 manifest：当前状态原子更新，运行记录以不可变文件保存。"""
+    """manifest 只索引阶段摘要；完整证据保存在不可变 run.json 中。"""
 
     def __init__(self, project_root: Path, output_dir: str | Path, project_name: str = "") -> None:
         try:
@@ -115,6 +127,11 @@ class ManifestStore:
         self.manifest_path = self.output_dir / "manifest.json"
         self.runs_dir = self.output_dir / "runs"
         self.project_name = project_name
+        self._mutex = threading.RLock()
+
+    @property
+    def lock_path(self) -> Path:
+        return self._safe_output_path("run.lock")
 
     def _safe_output_path(self, *parts: str) -> Path:
         relative = self._output_relative.joinpath(*parts)
@@ -127,6 +144,7 @@ class ManifestStore:
             "updated_at": utc_now(),
             "latest_run_id": None,
             "run_ids": [],
+            "run_count": 0,
             "stages": {},
         }
 
@@ -138,21 +156,72 @@ class ManifestStore:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ManifestError(f"无法读取 manifest {path}：{exc}") from exc
-        if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+        version = data.get("schema_version") if isinstance(data, dict) else None
+        if version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
             raise ManifestError(f"manifest 版本不受支持：{path}")
         if not isinstance(data.get("stages"), dict) or not isinstance(data.get("run_ids"), list):
             raise ManifestError(f"manifest 结构无效：{path}")
         return data
 
+    def _archive_legacy_manifest(self) -> None:
+        if not self.manifest_path.is_file():
+            return
+        raw = self.manifest_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        archive = self._safe_output_path("runs", "migrations", f"manifest-v1-{digest[:16]}.json")
+        if not archive.exists():
+            _atomic_write(archive, raw, replace=False)
+
+    def _compact_manifest(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        old_runs = manifest.get("run_ids", [])
+        all_run_ids = list(old_runs) if isinstance(old_runs, list) else []
+        run_ids = all_run_ids[-_RECENT_RUN_LIMIT:]
+        old_run_count = int(manifest.get("run_count", len(all_run_ids)) or 0)
+        old_stages = manifest.get("stages", {})
+        stages: dict[str, dict[str, Any]] = {}
+        if isinstance(old_stages, Mapping):
+            for name, record in old_stages.items():
+                if not isinstance(name, str) or not isinstance(record, Mapping):
+                    continue
+                summary = _stage_summary(record)
+                if summary.get("status") == "succeeded":
+                    summary["last_success_run_id"] = summary.get("run_id")
+                else:
+                    successful_id = None
+                    for run_id in reversed(run_ids):
+                        try:
+                            candidate = self.read_run_record(run_id)
+                        except ManifestError:
+                            continue
+                        if candidate.get("stage") == name and candidate.get("status") == "succeeded":
+                            successful_id = run_id
+                            break
+                    summary["last_success_run_id"] = successful_id
+                stages[name] = summary
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "project": dict(manifest.get("project", {})) if isinstance(manifest.get("project"), Mapping) else {},
+            "updated_at": manifest.get("updated_at", utc_now()),
+            "latest_run_id": manifest.get("latest_run_id"),
+            "run_ids": run_ids,
+            "run_count": max(len(all_run_ids), old_run_count),
+            "stages": stages,
+        }
+
     def save(self, manifest: Mapping[str, Any]) -> None:
-        data = dict(manifest)
-        if data.get("schema_version") != SCHEMA_VERSION:
-            raise ManifestError("拒绝保存 schema_version 不受支持的 manifest")
-        data["updated_at"] = utc_now()
-        output_dir = self._safe_output_path()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = self._safe_output_path("manifest.json")
-        _atomic_write(path, _json_bytes(data), replace=True)
+        with self._mutex:
+            data = dict(manifest)
+            version = data.get("schema_version")
+            if version == LEGACY_SCHEMA_VERSION:
+                self._archive_legacy_manifest()
+                data = self._compact_manifest(data)
+            elif version != SCHEMA_VERSION:
+                raise ManifestError("拒绝保存 schema_version 不受支持的 manifest")
+            data["updated_at"] = utc_now()
+            output_dir = self._safe_output_path()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            path = self._safe_output_path("manifest.json")
+            _atomic_write(path, _json_bytes(data), replace=True)
 
     def run_path(self, run_id: str) -> Path:
         if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:
@@ -161,14 +230,15 @@ class ManifestStore:
 
     def write_run_record(self, run_id: str, record: Mapping[str, Any]) -> Path:
         """写入不可变运行记录；已存在的 run_id 永不覆盖。"""
-        path = self.run_path(run_id)
-        data = dict(record)
-        data.setdefault("schema_version", SCHEMA_VERSION)
-        data["run_id"] = run_id
-        if data.get("schema_version") != SCHEMA_VERSION:
-            raise ManifestError("运行记录的 schema_version 与当前 Flow 版本不匹配")
-        _atomic_write(path, _json_bytes(data), replace=False)
-        return path
+        with self._mutex:
+            path = self.run_path(run_id)
+            data = dict(record)
+            data.setdefault("schema_version", SCHEMA_VERSION)
+            data["run_id"] = run_id
+            if data.get("schema_version") != SCHEMA_VERSION:
+                raise ManifestError("新运行记录必须使用当前 manifest 版本")
+            _atomic_write(path, _json_bytes(data), replace=False)
+            return path
 
     def read_run_record(self, run_id: str) -> dict[str, Any]:
         path = self.run_path(run_id)
@@ -176,39 +246,113 @@ class ManifestStore:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ManifestError(f"无法读取运行记录 {run_id}：{exc}") from exc
-        if not isinstance(data, dict) or data.get("run_id") != run_id or data.get("schema_version") != SCHEMA_VERSION:
+        if (
+            not isinstance(data, dict)
+            or data.get("run_id") != run_id
+            or data.get("schema_version") not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}
+        ):
             raise ManifestError(f"运行记录格式无效：{run_id}")
         return data
+
+    def stage_record(self, manifest: Mapping[str, Any], stage_name: str) -> dict[str, Any] | None:
+        stages = manifest.get("stages", {})
+        summary = stages.get(stage_name) if isinstance(stages, Mapping) else None
+        if not isinstance(summary, Mapping):
+            return None
+        run_id = summary.get("run_id")
+        if manifest.get("schema_version") == SCHEMA_VERSION and isinstance(run_id, str):
+            try:
+                return self.read_run_record(run_id)
+            except ManifestError:
+                # running 状态在 run.json 写入前发布，需保留摘要供 resume 读取。
+                if summary.get("status") == "running":
+                    return dict(summary)
+                raise
+        return dict(summary)
 
     def update_stage(self, stage_name: str, summary: Mapping[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
         if not isinstance(stage_name, str) or not _STAGE_ID.fullmatch(stage_name):
             raise ManifestError(f"阶段名称不安全： {stage_name!r}")
-        manifest = self.load()
-        stages = dict(manifest.get("stages", {}))
-        stage_record = dict(summary)
-        if run_id is not None:
-            # 发布阶段指针前，先确认对应的不可变证据文件已写入。
-            run_path = self.run_path(run_id)
-            if not run_path.is_file():
-                raise ManifestError(f"必须先写入运行记录，再发布阶段指针：{run_id}")
-            stage_record["run_id"] = run_id
-            run_ids = list(manifest.get("run_ids", []))
-            if run_id not in run_ids:
-                run_ids.append(run_id)
-            manifest["run_ids"] = run_ids
-            manifest["latest_run_id"] = run_id
-        stages[stage_name] = stage_record
-        manifest["stages"] = stages
-        self.save(manifest)
-        return manifest
+        with self._mutex:
+            manifest = self.load()
+            stages = dict(manifest.get("stages", {}))
+            previous = stages.get(stage_name, {})
+            stage_record = dict(summary)
+            if stage_record.get("status") == "succeeded":
+                stage_record["last_success_run_id"] = run_id or stage_record.get("run_id")
+            else:
+                last_success = previous.get("last_success_run_id") if isinstance(previous, Mapping) else None
+                if not last_success and isinstance(previous, Mapping) and previous.get("status") == "succeeded":
+                    last_success = previous.get("run_id")
+                stage_record["last_success_run_id"] = last_success
+            if run_id is not None:
+                run_path = self.run_path(run_id)
+                if not run_path.is_file():
+                    raise ManifestError(f"必须先写入运行记录，再发布阶段指针：{run_id}")
+                stage_record["run_id"] = run_id
+                run_ids = list(manifest.get("run_ids", []))
+                if run_id not in run_ids:
+                    previous_count = int(manifest.get("run_count", len(run_ids)))
+                    run_ids.append(run_id)
+                    manifest["run_count"] = previous_count + 1
+                manifest["run_ids"] = run_ids[-_RECENT_RUN_LIMIT:]
+                manifest["latest_run_id"] = run_id
+            stages[stage_name] = _stage_summary(stage_record)
+            manifest["stages"] = stages
+            self.save(manifest)
+            return self.load()
 
     def record_run(self, run_id: str, stage_name: str, record: Mapping[str, Any]) -> Path:
         """先持久化运行记录，再原子更新该阶段的最新指针。"""
-        path = self.write_run_record(run_id, record)
-        self.update_stage(stage_name, record, run_id=run_id)
-        return path
+        with self._mutex:
+            path = self.write_run_record(run_id, record)
+            self.update_stage(stage_name, record, run_id=run_id)
+            return path
 
     def latest_stage(self, stage_name: str) -> dict[str, Any] | None:
-        manifest = self.load()
-        value = manifest.get("stages", {}).get(stage_name)
-        return dict(value) if isinstance(value, dict) else None
+        return self.stage_record(self.load(), stage_name)
+
+    def successful_stage_record(self, manifest: Mapping[str, Any], stage_name: str) -> dict[str, Any] | None:
+        stages = manifest.get("stages", {})
+        summary = stages.get(stage_name) if isinstance(stages, Mapping) else None
+        if not isinstance(summary, Mapping):
+            return None
+        run_id = summary.get("last_success_run_id")
+        if not run_id and summary.get("status") == "succeeded":
+            run_id = summary.get("run_id")
+        if not isinstance(run_id, str):
+            return None
+        try:
+            return self.read_run_record(run_id)
+        except ManifestError:
+            return None
+
+    def list_runs(self, *, limit: int = 20, before_run_id: str | None = None,
+                  stage: str | None = None) -> list[dict[str, Any]]:
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ManifestError("run history limit 必须是 1 到 500 之间的整数")
+        if not self.runs_dir.exists():
+            return []
+        records = []
+        for child in self.runs_dir.iterdir():
+            if not child.is_dir() or not _RUN_ID.fullmatch(child.name):
+                continue
+            try:
+                record = self.read_run_record(child.name)
+            except ManifestError:
+                continue
+            if stage and record.get("stage") != stage:
+                continue
+            records.append(record)
+        records.sort(key=lambda item: (
+            str(item.get("started_at_utc", "")),
+            str(item.get("completed_at_utc", "")),
+            str(item.get("run_id", "")),
+        ))
+        if before_run_id is not None:
+            index = next((i for i, item in enumerate(records)
+                          if item.get("run_id") == before_run_id), None)
+            if index is None:
+                raise ManifestError(f"history cursor 不存在：{before_run_id}")
+            records = records[:index]
+        return list(reversed(records[-limit:]))

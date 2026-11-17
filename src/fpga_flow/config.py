@@ -17,12 +17,12 @@ STAGE_RUNNERS = frozenset({"command", "amd.zynq.jtag", "amd.qspi.program", "amd.
 DEFAULT_OUTPUT_DIR = "out/fpga-flow"
 _TOP_KEYS = {"schema_version", "project", "flow", "toolchains", "targets", "stages", "suites"}
 _PROJECT_KEYS = {"name", "description"}
-_FLOW_KEYS = {"output_dir", "default_target"}
-_TOOLCHAIN_KEYS = {"command", "version_args", "expected_version", "version_command"}
+_FLOW_KEYS = {"output_dir", "default_target", "max_parallel_stages"}
+_TOOLCHAIN_KEYS = {"command", "version_args", "expected_version", "version_command", "failure_markers"}
 _STAGE_KEYS = {
     "kind", "needs", "inputs", "outputs", "command", "cwd", "toolchains",
     "env", "timeout_seconds", "success_markers", "failure_markers",
-    "target", "destructive", "description", "runner", "options",
+    "side_effects", "resources", "target", "destructive", "description", "runner", "options",
 }
 
 
@@ -180,6 +180,9 @@ def load_profile(config_path: str | Path) -> FlowConfig:
     )
     default_target_value = flow.get("default_target")
     default_target = None if default_target_value is None else _string(default_target_value, "flow.default_target")
+    max_parallel_stages = flow.get("max_parallel_stages", 1)
+    if type(max_parallel_stages) is not int or max_parallel_stages < 1:
+        raise ProfileError("flow.max_parallel_stages 必须是大于或等于 1 的整数")
 
     raw_toolchains = _table(raw.get("toolchains", {}), "toolchains")
     toolchains: dict[str, ToolchainConfig] = {}
@@ -206,12 +209,9 @@ def load_profile(config_path: str | Path) -> FlowConfig:
         )
         if version_command is not None and not version_command:
             raise ProfileError(f"toolchains.{name}.version_command 不能为空")
+        failure_markers = _strings(definition.get("failure_markers", []), f"toolchains.{name}.failure_markers")
         toolchains[name] = ToolchainConfig(
-            name,
-            command,
-            version_args,
-            expected_version,
-            version_command,
+            name, command, version_args, expected_version, version_command, failure_markers,
         )
 
     raw_targets = _table(raw.get("targets", {}), "targets")
@@ -289,6 +289,8 @@ def load_profile(config_path: str | Path) -> FlowConfig:
             timeout_seconds=timeout_value,
             success_markers=_strings(definition.get("success_markers", []), f"stages.{name}.success_markers"),
             failure_markers=_strings(definition.get("failure_markers", []), f"stages.{name}.failure_markers"),
+            side_effects=_strings(definition.get("side_effects", []), f"stages.{name}.side_effects"),
+            resources=_strings(definition.get("resources", []), f"stages.{name}.resources"),
             target=target,
             destructive=destructive,
             description=stage_description,
@@ -325,6 +327,7 @@ def load_profile(config_path: str | Path) -> FlowConfig:
         root=root,
         config_path=path,
         output_dir=output_dir,
+        max_parallel_stages=max_parallel_stages,
         default_target=default_target,
         toolchains=MappingProxyType(toolchains),
         targets=MappingProxyType(targets),

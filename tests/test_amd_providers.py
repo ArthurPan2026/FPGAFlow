@@ -89,6 +89,37 @@ class AMDProviderTests(unittest.TestCase):
             self.assertIn("PSU", script)
             self.assertIn("恰好匹配一个目标", script)
 
+    def test_jtag_provider_preflight_does_not_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "fake_xsct_probe.py"
+            fake.write_text(
+                "print('PREFLIGHT_TARGET_OK PS')\n"
+                "print('PREFLIGHT_TARGET_OK PL')\n"
+                "print('PREFLIGHT_TARGET_OK CPU')\n"
+                "print('PREFLIGHT_READ_ONLY')\n",
+                encoding="utf-8",
+            )
+            stage = StageConfig(
+                "deploy_jtag", "deploy", (), (), (), (), root, ("xsct",),
+                MappingProxyType({}), target="board-a", runner="amd.zynq.jtag",
+                options=MappingProxyType({
+                    "hw_server_url": "tcp:localhost:3121",
+                    "ps_target_pattern": "PSU", "pl_target_pattern": "xczu*",
+                    "cpu_target_pattern": "APU*",
+                }),
+            )
+            profile = self._profile(root, stage=stage, toolchains={
+                "xsct": ToolchainConfig("xsct", (sys.executable, str(fake)), (), None),
+            })
+            result = ZynqJTAGProvider().preflight(stage, profile, root / "preflight", "board-a")
+            self.assertTrue(result["read_only"])
+            self.assertEqual(len(result["targets"]), 3)
+            script = (root / "preflight" / "jtag_preflight.tcl").read_text(encoding="utf-8")
+            self.assertNotIn("rst -", script)
+            self.assertNotIn("fpga ", script)
+            self.assertNotIn("dow ", script)
+
     def test_qspi_provider_probes_unique_target_and_verifies_readback(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fpga flow qspi ") as tmp:
             root = Path(tmp)
@@ -124,6 +155,9 @@ class AMDProviderTests(unittest.TestCase):
             })
             run_dir = root / "out/fpga-flow/runs/qspi-run"
             run_dir.mkdir(parents=True)
+            preflight = QSPIProgramProvider().preflight(stage, profile, run_dir / "preflight", "board-a")
+            self.assertTrue(preflight["read_only"])
+            self.assertEqual(preflight["target"]["target_name"], "board-serial-1")
             result = QSPIProgramProvider().execute(stage, profile, run_dir, "board-a")
             self.assertTrue(result.succeeded, result.stderr)
             self.assertIn("Verify Operation successful", result.stdout)

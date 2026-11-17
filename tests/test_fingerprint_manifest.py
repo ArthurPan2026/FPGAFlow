@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,7 +129,7 @@ class ManifestStoreTests(unittest.TestCase):
             root = Path(temporary)
             store = ManifestStore(root, "out/fpga-flow", "sample-amd-project")
             manifest = store.load()
-            self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["schema_version"], 2)
             self.assertEqual(manifest["project"]["name"], "sample-amd-project")
             run_id = "20261115T000000Z-abcd1234"
             record = {
@@ -181,6 +182,76 @@ class ManifestStoreTests(unittest.TestCase):
                 self.skipTest("symlinks are unavailable on this platform")
             with self.assertRaises(ManifestError):
                 store.load()
+
+    def test_manifest_keeps_only_recent_run_ids_and_history_reads_all_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ManifestStore(Path(temporary), "out/fpga-flow", "sample-amd-project")
+            for index in range(60):
+                run_id = f"20261115T{index:06d}Z-{index:08x}"
+                store.record_run(run_id, "hardware", {
+                    "stage": "hardware", "kind": "build", "status": "succeeded",
+                    "started_at_utc": f"2026-11-15T00:{index // 60:02d}:{index % 60:02d}Z",
+                    "inputs": {"src/top.sv": "a" * 64}, "dependencies": {},
+                    "tool_versions": {}, "toolchain_details": {}, "outputs": {},
+                    "evidence": {}, "fingerprint": f"{index:064x}",
+                })
+            manifest = store.load()
+            self.assertEqual(manifest["run_count"], 60)
+            self.assertEqual(len(manifest["run_ids"]), 50)
+            self.assertEqual(len(store.list_runs(limit=100)), 60)
+            self.assertEqual(len(store.list_runs(limit=7, stage="hardware")), 7)
+
+    def test_v1_manifest_migrates_on_first_write_and_keeps_full_run_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ManifestStore(root, "out/fpga-flow", "sample-amd-project")
+            store.runs_dir.mkdir(parents=True, exist_ok=True)
+            first_id = "20261115T000000Z-first1234"
+            failed_id = "20261115T000100Z-failed123"
+            first_record = {
+                "schema_version": 1, "run_id": first_id, "stage": "hardware",
+                "kind": "build", "status": "succeeded", "fingerprint": "a" * 64,
+                "inputs": {"src/top.sv": "b" * 64}, "dependencies": {}, "outputs": {},
+                "tool_versions": {}, "toolchain_details": {}, "evidence": {},
+            }
+            failed_record = {
+                "schema_version": 1, "run_id": failed_id, "stage": "hardware",
+                "kind": "build", "status": "failed", "fingerprint": None,
+                "inputs": {"src/top.sv": "c" * 64}, "dependencies": {}, "outputs": {},
+                "tool_versions": {}, "toolchain_details": {}, "evidence": {},
+            }
+            store.run_path(first_id).parent.mkdir(parents=True, exist_ok=True)
+            store.run_path(first_id).write_text(json.dumps(first_record), encoding="utf-8")
+            store.run_path(failed_id).parent.mkdir(parents=True, exist_ok=True)
+            store.run_path(failed_id).write_text(json.dumps(failed_record), encoding="utf-8")
+            legacy = {
+                "schema_version": 1, "project": {"name": "sample-amd-project"},
+                "updated_at": "2026-11-15T00:01:00Z", "latest_run_id": failed_id,
+                "run_ids": [first_id, failed_id],
+                "stages": {"hardware": failed_record},
+            }
+            store.output_dir.mkdir(parents=True, exist_ok=True)
+            store.manifest_path.write_text(json.dumps(legacy, indent=2), encoding="utf-8")
+            original_bytes = store.manifest_path.read_bytes()
+            self.assertEqual(store.load()["schema_version"], 1)
+
+            new_id = "20261115T000200Z-newrun1234"
+            store.record_run(new_id, "hardware", {
+                "stage": "hardware", "kind": "build", "status": "succeeded",
+                "inputs": {"src/top.sv": "d" * 64}, "outputs": {"out/design.bit": "e" * 64},
+                "fingerprint": "f" * 64, "dependencies": {}, "tool_versions": {},
+                "toolchain_details": {}, "evidence": {},
+            })
+            migrated = store.load()
+            self.assertEqual(migrated["schema_version"], 2)
+            summary = migrated["stages"]["hardware"]
+            self.assertNotIn("inputs", summary)
+            self.assertEqual(summary["last_success_run_id"], new_id)
+            self.assertEqual(migrated["run_ids"], [first_id, failed_id, new_id])
+            self.assertEqual(store.read_run_record(first_id)["inputs"]["src/top.sv"], "b" * 64)
+            snapshots = list((store.runs_dir / "migrations").glob("manifest-v1-*.json"))
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(snapshots[0].read_bytes(), original_bytes)
 
     def test_manifest_rejects_unsupported_schema_and_keeps_old_run_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
