@@ -1,8 +1,10 @@
 # FPGAFlow
 
-FPGAFlow 是一套面向 AMD Vivado/Vitis 工程的项目无关 CLI。核心处理阶段依赖、内容哈希、缓存、运行记录、工具预检和部署保护。消费项目在自己的仓库维护 profile、构建脚本、板卡身份和验收规则。
+FPGAFlow 是一套面向 AMD Vivado/Vitis 工程的项目无关 CLI。核心处理阶段依赖、内容哈希、缓存、运行记录、工具预检和部署保护。外部工程在自己的仓库维护 profile、构建脚本、板卡身份和验收规则。
 
-目前支持 Linux 和 Windows 主机，提供 argv 命令执行器、Vivado/Vitis 工具检查、Zynq JTAG、QSPI 和 UART provider。工具核心不包含任何消费项目的源码路径、ROM 路径或命令协议。
+目前支持 Linux 和 Windows 主机，提供 argv 命令执行器、Vivado/Vitis 工具检查、Zynq JTAG、QSPI 和 UART provider。工具核心不包含任何外部工程的源码路径、ROM 路径、应用协议或应用数据。
+
+FPGAFlow 的仓库内容只定义通用 schema、调度器、provider、缓存和示例 profile。具体工程名称、应用参数、存储路径、板级验收命令和部署策略必须留在外部工程 profile 中。
 
 ## 安装
 
@@ -21,7 +23,7 @@ Vivado、Vitis、XSCT、Bootgen 和板卡驱动仍需单独安装和授权。
 
 ## 项目配置
 
-每个消费项目在项目根目录维护 `fpga-flow.toml`。配置声明输入、产物、阶段依赖图、工具版本、目标、资源锁和测试规则。所有项目路径都相对于 profile 所在目录，并使用正斜线。
+每个外部工程在项目根目录维护 `fpga-flow.toml`。配置声明输入、产物、阶段依赖图、工具版本、目标、资源锁和测试规则。所有项目路径都相对于 profile 所在目录，并使用正斜线。
 
 `flow.max_parallel_stages` 默认值为 1。项目可提高并行上限，并用阶段的 `resources` 声明共享资源。Flow 还会锁住同一工具链、同一板卡身份和相互覆盖的输出路径。
 
@@ -32,7 +34,7 @@ Vivado、Vitis、XSCT、Bootgen 和板卡驱动仍需单独安装和授权。
 - `examples/zynq7000-rtl-ps/flow.toml` 展示 RTL + PS 流程。
 - `examples/zynq7000-hls-ps/flow.toml` 展示 HLS、PL、PS、启动镜像和 QSPI 阶段。
 
-阶段命令按 argv 数组执行，不经过 shell。只有被 profile 声明的输入和依赖产物会参与阶段指纹。工具专属的增量构建逻辑留在消费项目脚本中。
+阶段命令按 argv 数组执行，不经过 shell。只有被 profile 声明的输入和依赖产物会参与阶段指纹。工具专属的增量构建逻辑留在外部工程脚本中。
 
 ## 常用命令
 

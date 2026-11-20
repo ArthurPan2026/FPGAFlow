@@ -2,9 +2,11 @@
 
 ## 职责边界
 
-FPGAFlow 是 AMD Vivado/Vitis 工程通用的构建、验证和部署工具。核心只处理 profile、阶段依赖、工具版本、内容指纹、缓存、运行记录、日志和安全门。消费项目在自身仓库维护 RTL、HLS、PS 配置、板卡参数和验收规则。
+FPGAFlow 是 AMD Vivado/Vitis 工程通用的构建、验证和部署工具。核心只处理 profile、阶段依赖、工具版本、内容指纹、缓存、运行记录、日志和安全门。外部工程在自身仓库维护 RTL、HLS、PS 配置、板卡参数和验收规则。
 
-provider 负责 Vivado/Vitis、XSCT、QSPI 和 UART 等通用操作。provider 不保存具体消费工程路径、ROM 名称或项目命令。已有项目脚本通过 argv 命令执行器接入。
+provider 负责 Vivado/Vitis、XSCT、QSPI 和 UART 等通用操作。provider 不保存外部工程路径、ROM 名称、应用命令或项目协议。外部脚本通过 argv 命令执行器接入。
+
+核心包不依赖任何具体工程的目录、应用、存储布局或板级验收语义。项目专属信息只能出现在外部 profile 和外部脚本中。
 
 AMD Ross 文档搜索和 Vivado MCP 用于资料查询和交互调试。FPGAFlow Skill 只说明如何读取运行状态和调用 CLI，不维护第二份执行状态。
 
