@@ -39,6 +39,14 @@ class StageConfig:
     options: Mapping[str, Any] = field(default_factory=dict)
 
 
+
+@dataclass(frozen=True, slots=True)
+class BundleConfig:
+    schema_version: int
+    output_dir: Path
+    artifacts: Mapping[str, str]
+    dependencies: Mapping[str, str] = field(default_factory=dict)
+
 @dataclass(frozen=True, slots=True)
 class FlowConfig:
     schema_version: int
@@ -52,3 +60,4 @@ class FlowConfig:
     stages: Mapping[str, StageConfig]
     suites: Mapping[str, tuple[str, ...]]
     max_parallel_stages: int = 1
+    bundle: BundleConfig | None = None

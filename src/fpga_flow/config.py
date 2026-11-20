@@ -8,14 +8,14 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from .models import FlowConfig, StageConfig, ToolchainConfig
+from .models import BundleConfig, FlowConfig, StageConfig, ToolchainConfig
 
 
 SUPPORTED_SCHEMA_VERSION = 1
 STAGE_KINDS = frozenset({"build", "test", "validate", "deploy"})
 STAGE_RUNNERS = frozenset({"command", "amd.zynq.jtag", "amd.qspi.program", "amd.uart.commands"})
 DEFAULT_OUTPUT_DIR = "out/fpga-flow"
-_TOP_KEYS = {"schema_version", "project", "flow", "toolchains", "targets", "stages", "suites"}
+_TOP_KEYS = {"schema_version", "project", "flow", "toolchains", "targets", "stages", "suites", "bundle"}
 _PROJECT_KEYS = {"name", "description"}
 _FLOW_KEYS = {"output_dir", "default_target", "max_parallel_stages"}
 _TOOLCHAIN_KEYS = {"command", "version_args", "expected_version", "version_command", "failure_markers"}
@@ -223,6 +223,43 @@ def load_profile(config_path: str | Path) -> FlowConfig:
     if default_target is not None and default_target not in targets:
         raise ProfileError(f"flow.default_target 引用了未知目标 {default_target!r}")
 
+    bundle: BundleConfig | None = None
+    raw_bundle = raw.get("bundle")
+    if raw_bundle is not None:
+        bundle_table = _table(raw_bundle, "bundle")
+        bundle_schema = bundle_table.get("schema_version", 3)
+        if type(bundle_schema) is not int or bundle_schema != 3:
+            raise ProfileError("bundle.schema_version 必须为 3")
+        bundle_output = _relative_path(
+            bundle_table.get("output_dir", "out/current"),
+            "bundle.output_dir",
+            root,
+            allow_glob=False,
+        )
+        raw_artifacts = _table(bundle_table.get("artifacts"), "bundle.artifacts")
+        artifacts: dict[str, str] = {}
+        for artifact_name, artifact_path in raw_artifacts.items():
+            if not isinstance(artifact_name, str) or not artifact_name.strip():
+                raise ProfileError("bundle.artifacts 名称不能为空")
+            artifacts[artifact_name] = _relative_path(
+                artifact_path,
+                f"bundle.artifacts.{artifact_name}",
+                root,
+                allow_glob=False,
+            ).relative_to(root).as_posix()
+        if not artifacts:
+            raise ProfileError("bundle.artifacts 至少需要一个产物")
+        dependencies = _string_table(
+            bundle_table.get("dependencies", {}),
+            "bundle.dependencies",
+        )
+        bundle = BundleConfig(
+            schema_version=bundle_schema,
+            output_dir=bundle_output,
+            artifacts=MappingProxyType(artifacts),
+            dependencies=dependencies,
+        )
+
     raw_stages = _table(raw.get("stages"), "stages")
     if not raw_stages:
         raise ProfileError("stages 至少需要包含一个阶段")
@@ -333,6 +370,7 @@ def load_profile(config_path: str | Path) -> FlowConfig:
         targets=MappingProxyType(targets),
         stages=MappingProxyType(stages),
         suites=MappingProxyType(suites),
+        bundle=bundle,
     )
     # 校验所有阶段，包括当前选择的套件无法到达的循环依赖。
     topological_order(config, tuple(stages))

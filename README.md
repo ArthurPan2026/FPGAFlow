@@ -79,3 +79,10 @@ python -m unittest discover -s tests -v
 ```
 
 CI 在 Ubuntu 和 Windows 运行同一套测试。主机回归、RTL 仿真、UART 状态、QSPI 读回和画面目视验收分别记录。UART 或仿真通过不能代替画面验收。
+
+
+## Bundle 与发布产物
+
+profile 可以声明 bundle。阶段完成且所有声明产物的输入指纹和输出哈希都有效时，FPGAFlow 会在 out/current/ 生成统一文件和 bundle.json。bundle.json 使用 schema 3，记录 profile hash、硬件和软件产物 hash、依赖摘要、工具版本和部署验证状态。部署 provider 只应引用 bundle 或阶段声明的产物。
+
+QSPI provider 的 verify 默认由 profile 决定。开发 profile 可以关闭读回校验以缩短迭代；发布 profile 应单独声明 verify=true，并通过显式 release 部署阶段执行。

@@ -17,6 +17,7 @@ import time
 import uuid
 
 from .config import ProfileError, topological_order
+from .bundle import refresh_bundle
 from .fingerprint import (
     FingerprintError,
     expand_inputs,
@@ -699,6 +700,13 @@ class FlowEngine:
             record["evidence"] = {}
             record["evidence_hash_error"] = str(exc)
         self.store.record_run(run_id, stage.name, record)
+        if status == "succeeded" and getattr(self.profile, "bundle", None) is not None:
+            try:
+                refresh_bundle(self.profile, self.store)
+            except Exception as exc:
+                (run_dir / "bundle-error.txt").write_text(
+                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                )
         if self._active_run_lock is not None:
             self._active_run_lock.clear_stage(run_id)
         if status == "succeeded":
