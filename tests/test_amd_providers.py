@@ -120,7 +120,7 @@ class AMDProviderTests(unittest.TestCase):
             self.assertNotIn("fpga ", script)
             self.assertNotIn("dow ", script)
 
-    def test_qspi_provider_probes_unique_target_and_verifies_readback(self) -> None:
+    def test_qspi_provider_defaults_to_programming_without_readback(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fpga flow qspi ") as tmp:
             root = Path(tmp)
             self._artifacts(root)
@@ -130,7 +130,6 @@ class AMDProviderTests(unittest.TestCase):
                 "if '-jtagtargets' in sys.argv:\n"
                 " print('2 board-serial-1 (name arm_dap idcode 4ba00477)')\n"
                 " raise SystemExit(0)\n"
-                "print('Verify Operation successful.')\n"
                 "print('Flash Operation Successful')\n",
                 encoding="utf-8",
             )
@@ -160,13 +159,46 @@ class AMDProviderTests(unittest.TestCase):
             self.assertEqual(preflight["target"]["target_name"], "board-serial-1")
             result = QSPIProgramProvider().execute(stage, profile, run_dir, "board-a")
             self.assertTrue(result.succeeded, result.stderr)
-            self.assertIn("Verify Operation successful", result.stdout)
             self.assertIn("-blank_check", result.command)
-            self.assertIn("-verify", result.command)
+            self.assertNotIn("-verify", result.command)
             self.assertNotIn("-erase_all", result.command)
             selection = (run_dir / "target-selection.json").read_text(encoding="utf-8")
             self.assertIn("board-serial-1", selection)
             self.assertFalse(json_read(selection)["erase_all"])
+
+    def test_qspi_provider_opt_in_readback_verification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fpga flow qspi verify ") as tmp:
+            root = Path(tmp)
+            self._artifacts(root)
+            fake = root / "fake_program_flash.py"
+            fake.write_text(
+                "import sys\n"
+                "if '-jtagtargets' in sys.argv:\n"
+                " print('2 board-serial-1 (name arm_dap idcode 4ba00477)')\n"
+                " raise SystemExit(0)\n"
+                "print('Verify Operation successful.')\n",
+                encoding="utf-8",
+            )
+            stage = StageConfig(
+                "deploy_qspi", "deploy", ("boot", "platform"),
+                ("out/boot/BOOT.BIN", "out/platform/fsbl.elf"), (), (), root,
+                ("program_flash",), MappingProxyType({}), 120,
+                target="board-a", destructive=True, runner="amd.qspi.program",
+                options=MappingProxyType({
+                    "boot_image": "out/boot/BOOT.BIN", "fsbl": "out/platform/fsbl.elf",
+                    "flash_type": "qspi-x4-single", "offset": 0,
+                    "target_device_name": "arm_dap", "target_name_contains": "board-serial-1",
+                    "server_url": "tcp:localhost:3121", "verify": True,
+                }),
+            )
+            profile = self._profile(root, stage=stage, toolchains={
+                "program_flash": ToolchainConfig("program_flash", (sys.executable, str(fake)), (), None),
+            })
+            run_dir = root / "out/fpga-flow/runs/qspi-verify"
+            run_dir.mkdir(parents=True)
+            result = QSPIProgramProvider().execute(stage, profile, run_dir, "board-a")
+            self.assertTrue(result.succeeded, result.stderr)
+            self.assertIn("-verify", result.command)
 
     def test_jtag_provider_rejects_artifacts_not_owned_by_prerequisite_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

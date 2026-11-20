@@ -32,17 +32,23 @@ class AmdDeployHelpersTests(unittest.TestCase):
         self.assertEqual(argv[0], "C:/AMD Tools/Vitis/program_flash.bat")
         self.assertEqual(argv[-1], "tcp:127.0.0.1:3121")
 
-    def test_qspi_command_requires_readback_and_never_erases_all(self) -> None:
+    def test_qspi_command_defaults_to_programming_without_readback(self) -> None:
         argv = build_qspi_program_argv(
             "program_flash", "out/BOOT.BIN", "out/fsbl.elf",
             flash_type="qspi-x4-single", offset=0x400000,
             target_name="board serial 123", server_url="tcp:localhost:3121",
         )
         self.assertIn("-blank_check", argv)
-        self.assertIn("-verify", argv)
+        self.assertNotIn("-verify", argv)
         self.assertNotIn("-erase_all", argv)
         self.assertEqual(argv[argv.index("-offset") + 1], str(0x400000))
         self.assertEqual(argv[argv.index("-target_name") + 1], "board serial 123")
+        verified = build_qspi_program_argv(
+            "program_flash", "out/BOOT.BIN", "out/fsbl.elf",
+            flash_type="qspi-x4-single", offset=0,
+            target_name="board", server_url="tcp:localhost:3121", verify=True,
+        )
+        self.assertIn("-verify", verified)
         with self.assertRaises(DeployCommandError):
             build_qspi_program_argv("p", "b", "f", flash_type="qspi", offset=-1,
                                     target_name="board", server_url="tcp:localhost:3121")

@@ -150,7 +150,7 @@ class ZynqJTAGProvider:
 
 
 class QSPIProgramProvider:
-    """对一个 QSPI 镜像进行编程，并执行空白检查和读回验证。"""
+    """对一个 QSPI 镜像进行编程；读回验证由 profile 显式启用。"""
 
     def preflight(self, stage: StageConfig, profile: FlowConfig, run_dir: Path,
                   target: str | None) -> dict[str, Any]:
@@ -216,14 +216,17 @@ class QSPIProgramProvider:
             return CommandResult(tuple(query), profile.root, query_result.started_at_utc,
                                  _now(), query_result.elapsed_seconds, 2, False,
                                  query_result.stdout, f"{exc}\n", str(exc))
+        verify = bool(options.get("verify", False))
+        blank_check = bool(options.get("blank_check", True))
         selection = {"status": "selected", "target": dict(selected), "targets": targets,
                      "boot_image": image_rel, "fsbl": fsbl_rel,
                      "offset": offset, "flash_type": str(options["flash_type"]),
-                     "verify": True, "blank_check": True, "erase_all": False}
+                     "verify": verify, "blank_check": blank_check, "erase_all": False}
         (run_dir / "target-selection.json").write_text(json.dumps(selection, indent=2), encoding="utf-8")
         qspi_argv = build_qspi_program_argv(
             prefix[0], boot_image, fsbl, flash_type=str(options["flash_type"]),
             offset=offset, target_name=str(selected["target_name"]), server_url=server_url,
+            verify=verify, blank_check=blank_check,
         )
         command = [*prefix, *qspi_argv[1:]]
         program_result = run_command(command, cwd=profile.root, env=stage.env,
@@ -231,7 +234,7 @@ class QSPIProgramProvider:
                                       log_dir=run_dir / "program")
         output_text = program_result.stdout + "\n" + program_result.stderr
         verify_marker = str(options.get("verify_marker", "Verify Operation successful"))
-        if program_result.succeeded and verify_marker not in output_text:
+        if verify and program_result.succeeded and verify_marker not in output_text:
             return CommandResult(tuple(command), profile.root, query_result.started_at_utc,
                                  program_result.completed_at_utc,
                                  query_result.elapsed_seconds + program_result.elapsed_seconds,

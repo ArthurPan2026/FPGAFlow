@@ -145,7 +145,12 @@ class ProjectRunLock:
         if isinstance(exc, BlockingIOError):
             return True
         if os.name == "nt":
-            return getattr(exc, "winerror", None) in {33, 36}
+            # msvcrt.locking can surface an existing cross-process byte lock as
+            # PermissionError/errno 13 on hosted Windows runners.
+            return (
+                getattr(exc, "winerror", None) in {13, 33, 36}
+                or getattr(exc, "errno", None) == 13
+            )
         return getattr(exc, "errno", None) in {errno_value("EAGAIN"), errno_value("EWOULDBLOCK")}
 
     @staticmethod

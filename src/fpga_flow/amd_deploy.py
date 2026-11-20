@@ -71,18 +71,24 @@ def build_qspi_program_argv(
     offset: int,
     target_name: str,
     server_url: str,
+    verify: bool = False,
+    blank_check: bool = True,
 ) -> list[str]:
-    """构造范围受限的 QSPI 写入和读回命令；绝不请求整片擦除。"""
+    """构造范围受限的 QSPI 写入命令；读回校验需要显式启用。"""
     if offset < 0:
         raise DeployCommandError("QSPI 偏移量不能为负数")
     if not flash_type.strip() or not target_name.strip() or not server_url.strip():
         raise DeployCommandError("必须提供 Flash 类型、唯一目标名称和 hw_server URL")
-    return [
+    command = [
         str(program_flash), "-f", str(boot_image), "-fsbl", str(fsbl),
         "-flash_type", flash_type, "-offset", str(offset),
-        "-blank_check", "-verify", "-target_name", target_name,
-        "-url", server_url,
+        "-target_name", target_name, "-url", server_url,
     ]
+    if blank_check:
+        command.insert(command.index("-target_name"), "-blank_check")
+    if verify:
+        command.insert(command.index("-target_name"), "-verify")
+    return command
 
 
 def tcl_quote(value: str | Path) -> str:
