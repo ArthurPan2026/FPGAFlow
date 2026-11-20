@@ -46,6 +46,21 @@
         }
       }
     },
+    "bundle": {
+      "type": "object",
+      "required": ["artifacts"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 3},
+        "output_dir": {"$ref": "#/$defs/projectRelativePath"},
+        "artifacts": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/projectRelativePath"}
+        },
+        "dependencies": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
     "toolchains": {
       "type": "object",
       "additionalProperties": {

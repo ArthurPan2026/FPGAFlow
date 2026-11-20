@@ -1,99 +1,111 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
-import textwrap
 import unittest
 
-from fpga_flow.bundle import refresh_bundle
-from fpga_flow.config import load_profile
-from fpga_flow.manifest import ManifestStore
+from fpga_flow.config import ProfileError, load_profile
+from fpga_flow.engine import FlowEngine, FlowError
 
 
 class BundleTests(unittest.TestCase):
-    def test_bundle_materializes_only_hash_verified_stage_outputs(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for relative, payload in (
-                ("out/fpga-flow/artifacts/bitstream.bit", b"bit"),
-                ("out/fpga-flow/artifacts/hardware.xsa", b"xsa"),
-                ("out/fpga-flow/artifacts/fsbl.elf", b"fsbl"),
-                ("out/fpga-flow/artifacts/app.elf", b"app"),
-                ("out/fpga-flow/artifacts/BOOT.BIN", b"boot"),
-            ):
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(payload)
-            config = root / "fpga-flow.toml"
-            config.write_text(textwrap.dedent("""
-                schema_version = 1
-                [project]
-                name = "bundle-test"
-                [flow]
-                output_dir = "out/fpga-flow"
-                [bundle]
-                schema_version = 3
-                output_dir = "out/current"
-                artifacts = { bitstream = "out/fpga-flow/artifacts/bitstream.bit", xsa = "out/fpga-flow/artifacts/hardware.xsa", fsbl = "out/fpga-flow/artifacts/fsbl.elf", app = "out/fpga-flow/artifacts/app.elf", boot_bin = "out/fpga-flow/artifacts/BOOT.BIN" }
-                [toolchains.python]
-                command = "python"
-                [stages.hardware]
-                kind = "build"
-                outputs = ["out/fpga-flow/artifacts/bitstream.bit", "out/fpga-flow/artifacts/hardware.xsa"]
-                command = ["python", "-c", "pass"]
-                toolchains = ["python"]
-                [stages.platform]
-                kind = "build"
-                needs = ["hardware"]
-                outputs = ["out/fpga-flow/artifacts/fsbl.elf"]
-                command = ["python", "-c", "pass"]
-                toolchains = ["python"]
-                [stages.app]
-                kind = "build"
-                needs = ["platform"]
-                outputs = ["out/fpga-flow/artifacts/app.elf"]
-                command = ["python", "-c", "pass"]
-                toolchains = ["python"]
-                [stages.boot]
-                kind = "build"
-                needs = ["app"]
-                outputs = ["out/fpga-flow/artifacts/BOOT.BIN"]
-                command = ["python", "-c", "pass"]
-                toolchains = ["python"]
-            """), encoding="utf-8")
-            profile = load_profile(config)
-            store = ManifestStore(root, profile.output_dir, profile.project_name)
-            for stage, outputs in {
-                "hardware": ["out/fpga-flow/artifacts/bitstream.bit", "out/fpga-flow/artifacts/hardware.xsa"],
-                "platform": ["out/fpga-flow/artifacts/fsbl.elf"],
-                "app": ["out/fpga-flow/artifacts/app.elf"],
-                "boot": ["out/fpga-flow/artifacts/BOOT.BIN"],
-            }.items():
-                record = {
-                    "stage": stage,
-                    "kind": "build",
-                    "status": "succeeded",
-                    "outputs": {
-                        path: hashlib.sha256((root / path).read_bytes()).hexdigest()
-                        for path in outputs
-                    },
-                    "tool_versions": {"python": "python"},
-                    "inputs": {},
-                    "dependencies": {},
-                    "evidence": {},
-                }
-                run_id = f"run-{stage}"
-                store.record_run(run_id, stage, record)
-            payload = refresh_bundle(profile, store)
-            self.assertIsNotNone(payload)
-            self.assertEqual(payload["schema_version"], 3)
-            self.assertTrue((root / "out/current/bundle.json").is_file())
-            self.assertEqual(
-                json.loads((root / "out/current/bundle.json").read_text())["artifacts"]["boot_bin"]["path"],
-                "out/current/BOOT.BIN",
-            )
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "src").mkdir()
+        for name in ("hw", "platform", "app", "boot"):
+            (self.root / "src" / name).write_text(name, encoding="utf-8")
+        (self.root / "build.py").write_text(
+            "from pathlib import Path\nimport sys\n"
+            "p=Path(sys.argv[2]); p.parent.mkdir(parents=True,exist_ok=True)\n"
+            "p.write_text(Path(sys.argv[1]).read_text())\n", encoding="utf-8")
+        lines = [
+            "schema_version = 1", "[project]", 'name = "generic-fixture"',
+            "[flow]", 'output_dir = "out/flow"', 'default_target = "board"',
+            "[bundle]", 'output_dir = "out/current"', "[bundle.artifacts]",
+            'bitstream = "out/build/hardware.bit"', 'fsbl = "out/build/fsbl.elf"',
+            'app = "out/build/app.elf"', 'boot_bin = "out/build/boot.bin"',
+            "[toolchains.python]", "command = " + json.dumps(sys.executable),
+            "[targets.board]", 'family = "generic"',
+        ]
+        for stage, source, output, needs in (
+            ("logic", "hw", "hardware.bit", []),
+            ("runtime", "platform", "fsbl.elf", ["logic"]),
+            ("software", "app", "app.elf", ["runtime"]),
+            ("image", "boot", "boot.bin", ["logic", "runtime", "software"]),
+        ):
+            lines += [f"[stages.{stage}]", 'kind = "build"',
+                      "needs = " + json.dumps(needs),
+                      "inputs = " + json.dumps([f"src/{source}", "build.py"]),
+                      "outputs = " + json.dumps([f"out/build/{output}"]),
+                      "command = " + json.dumps([sys.executable, "build.py", f"src/{source}", f"out/build/{output}"]),
+                      'toolchains = ["python"]']
+        self.config = self.root / "fpga-flow.toml"
+        self.config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.engine = FlowEngine(load_profile(self.config))
+
+    def _bundle(self) -> dict:
+        return json.loads((self.root / "out/current/bundle.json").read_text(encoding="utf-8"))
+
+    def test_generates_bundle_from_nonstandard_stage_names(self) -> None:
+        self.engine.build("image", with_deps=True)
+        data = self._bundle()
+        self.assertEqual(data["schema_version"], 3)
+        self.assertEqual(data["artifacts"]["bitstream"]["stage"], "logic")
+        self.assertEqual((self.root / "out/current/BOOT.BIN").read_text(), "boot")
+        self.assertFalse(any(data["verification"].values()))
+
+    def test_new_hardware_cannot_publish_with_stale_downstream_results(self) -> None:
+        self.engine.build("image", with_deps=True)
+        old = self._bundle()
+        (self.root / "src/hw").write_text("new hardware", encoding="utf-8")
+        self.engine.build("logic")
+        self.assertEqual(self._bundle()["bundle_id"], old["bundle_id"])
+        with self.assertRaises(FlowError) as caught:
+            self.engine._refresh_bundle("board", required=True)
+        self.assertEqual(caught.exception.code, "FLOW-BUNDLE-STALE")
+        self.engine.build("image", with_deps=True)
+        self.assertNotEqual(self._bundle()["bundle_id"], old["bundle_id"])
+        self.assertEqual((self.root / "out/current/bitstream.bit").read_text(), "new hardware")
+
+    def test_verification_is_not_inherited_by_a_different_bundle(self) -> None:
+        self.engine.build("image", with_deps=True)
+        bundle = self._bundle()
+        bundle["verification"]["qspi_readback_verified"] = True
+        (self.root / "out/current/bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
+        (self.root / "src/app").write_text("new software", encoding="utf-8")
+        self.engine.build("image", with_deps=True)
+        updated = self._bundle()
+        self.assertNotEqual(bundle["bundle_id"], updated["bundle_id"])
+        self.assertFalse(updated["verification"]["qspi_readback_verified"])
+
+    def test_bundle_configuration_rejects_unknown_producer(self) -> None:
+        source = self.config.read_text().replace('fsbl = "out/build/fsbl.elf"', 'fsbl = "out/build/missing.elf"')
+        self.config.write_text(source)
+        with self.assertRaises(ProfileError):
+            load_profile(self.config)
+
+    def test_release_rejects_unverified_qspi_before_running_stages(self) -> None:
+        with self.config.open("a", encoding="utf-8") as stream:
+            stream.write('\n[stages.flash]\nkind = "deploy"\nrunner = "amd.qspi.program"\n'
+                         'target = "board"\nneeds = ["image"]\noptions = {verify = false}\n')
+        engine = FlowEngine(load_profile(self.config))
+        with self.assertRaises(FlowError) as caught:
+            engine.release(target="board", deploy=True, deploy_stage="flash")
+        self.assertEqual(caught.exception.code, "FLOW-RELEASE-QSPI-VERIFY")
+        self.assertFalse((self.root / "out/build").exists())
+
+    def test_input_modified_during_execution_is_not_recorded_as_success(self) -> None:
+        script = self.root / "build.py"
+        script.write_text("from pathlib import Path\nPath('src/hw').write_text('mutated')\n"
+                          "p=Path('out/build/hardware.bit');p.parent.mkdir(parents=True,exist_ok=True);p.write_text('bit')\n")
+        with self.assertRaises(FlowError) as caught:
+            self.engine.build("logic")
+        self.assertEqual(caught.exception.code, "FLOW-INPUT-CHANGED")
+        self.assertFalse((self.root / "out/current/bundle.json").exists())
 
 
 if __name__ == "__main__":

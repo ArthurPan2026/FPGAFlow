@@ -7,11 +7,11 @@ import sys
 import time
 from typing import Any, Sequence
 
-from .config import ProfileError
-from .engine import FlowEngine, FlowError
-from .fingerprint import FingerprintError
-from .manifest import ManifestError
-from .providers.amd import builtin_providers
+lazy from .config import ProfileError
+lazy from .engine import FlowEngine, FlowError
+lazy from .fingerprint import FingerprintError
+lazy from .manifest import ManifestError
+lazy from .providers.amd import builtin_providers
 
 
 class ChineseArgumentParser(argparse.ArgumentParser):

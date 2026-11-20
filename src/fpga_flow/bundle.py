@@ -1,6 +1,7 @@
-"""Materialize a verified, content-addressed bundle for a Flow profile."""
+"""Publish and validate a bundle composed from current Flow stage records."""
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -8,6 +9,21 @@ from pathlib import Path
 import shutil
 import tempfile
 from typing import Any, Mapping
+
+from .fingerprint import FingerprintError, hash_artifact
+
+
+class BundleError(ValueError):
+    """A bundle cannot be constructed or does not match its source records."""
+
+
+_FILENAMES = {
+    "bitstream": "bitstream.bit", "xsa": "hardware.xsa", "hardware_xsa": "hardware.xsa",
+    "fsbl": "fsbl.elf", "fsbl_elf": "fsbl.elf", "ps7_init": "ps7_init.tcl",
+    "ps7_init_tcl": "ps7_init.tcl", "xpfm": "platform.xpfm", "platform": "platform.xpfm",
+    "app": "app.elf", "app_elf": "app.elf", "application": "app.elf",
+    "boot": "BOOT.BIN", "boot_bin": "BOOT.BIN", "boot.bin": "BOOT.BIN",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -19,138 +35,184 @@ def _sha256(path: Path) -> str:
 
 
 def _json_sha256(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def _atomic_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+def _checked_dir(root: Path, directory: Path) -> Path:
+    root = root.resolve(strict=True)
+    try:
+        parts = directory.relative_to(root).parts
+    except ValueError as exc:
+        raise BundleError("bundle 输出目录必须位于项目内") from exc
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink() or (getattr(current, "is_junction", lambda: False)()):
+            raise BundleError(f"bundle 输出目录包含链接：{current}")
+        current.mkdir(exist_ok=True)
+    return current
+
+
+def artifact_producers(profile: Any) -> dict[str, str]:
+    """Resolve each declared artifact to exactly one build-stage output."""
+    bundle = getattr(profile, "bundle", None)
+    if bundle is None:
+        return {}
+    owners: dict[str, str] = {}
+    filenames: set[str] = set()
+    for key, relative in bundle.artifacts.items():
+        matches = [name for name, stage in profile.stages.items()
+                   if stage.kind == "build" and any(
+                       fnmatch.fnmatchcase(relative, pattern) for pattern in stage.outputs)]
+        if len(matches) != 1:
+            raise BundleError(f"bundle 产物 {key!r} 必须由唯一构建阶段声明，实际：{matches}")
+        filename = _FILENAMES.get(key, Path(relative).name)
+        if not filename or filename in filenames or filename == "bundle.json":
+            raise BundleError(f"bundle 输出文件名冲突：{filename!r}")
+        filenames.add(filename)
+        owners[key] = matches[0]
+    return owners
+
+
+def _atomic_copy(source: Path, destination: Path, expected: str) -> None:
+    if destination.is_symlink():
+        raise BundleError(f"拒绝覆盖符号链接：{destination}")
     fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
-    os.close(fd)
     temporary = Path(name)
     try:
-        shutil.copyfile(source, temporary)
+        with os.fdopen(fd, "wb") as stream, source.open("rb") as original:
+            shutil.copyfileobj(original, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _sha256(temporary) != expected:
+            raise BundleError(f"复制时产物发生变化：{source}")
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _stage_for_key(key: str) -> str:
-    normalized = key.lower()
-    if normalized in {"bitstream", "xsa", "hardware_xsa"}:
-        return "hardware"
-    if normalized in {"fsbl", "fsbl_elf", "ps7_init", "ps7_init_tcl", "xpfm", "platform"}:
-        return "platform"
-    if normalized in {"app", "app_elf", "application"}:
-        return "app"
-    if normalized in {"boot", "boot_bin", "boot.bin"}:
-        return "boot"
-    return normalized
+def _atomic_json(path: Path, data: Mapping[str, Any]) -> None:
+    if path.is_symlink():
+        raise BundleError(f"拒绝覆盖符号链接：{path}")
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(data, stream, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def refresh_bundle(profile: Any, store: Any) -> dict[str, Any] | None:
-    """Refresh out/current once every declared artifact is current and verified.
+def refresh_bundle(profile: Any, records: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Publish artifacts from stage records already validated by the Flow engine.
 
-    Profiles without a bundle section are unaffected. A missing or stale
-    upstream stage returns None and leaves the previous bundle untouched.
+    The manifest is written last. Consumers must validate every referenced hash,
+    so an interrupted copy fails closed instead of presenting a mixed bundle.
     """
-    bundle = getattr(profile, "bundle", None)
+    bundle = profile.bundle
     if bundle is None:
-        return None
-    manifest = store.load()
-    resolved: dict[str, tuple[str, Path, str]] = {}
+        raise BundleError("profile 未配置 bundle")
+    owners = artifact_producers(profile)
+    resolved: dict[str, tuple[str, str]] = {}
     for key, relative in bundle.artifacts.items():
-        stage_name = _stage_for_key(key)
-        record = store.successful_stage_record(manifest, stage_name)
-        if not isinstance(record, Mapping) or record.get("status") != "succeeded":
-            return None
-        source = profile.root / relative
-        if source.is_symlink() or not source.is_file():
-            return None
-        outputs = record.get("outputs")
+        owner = owners[key]
+        record = records.get(owner)
+        outputs = record.get("outputs") if isinstance(record, Mapping) else None
         expected = outputs.get(relative) if isinstance(outputs, Mapping) else None
-        actual = _sha256(source)
-        if not isinstance(expected, str) or expected != actual:
-            return None
-        resolved[key] = (stage_name, source, actual)
-
-    output_dir = bundle.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    published: dict[str, dict[str, str]] = {}
-    hardware: dict[str, dict[str, str]] = {}
-    software: dict[str, dict[str, str]] = {}
-    filename_map = {
-        "bitstream": "bitstream.bit",
-        "xsa": "hardware.xsa",
-        "hardware_xsa": "hardware.xsa",
-        "fsbl": "fsbl.elf",
-        "fsbl_elf": "fsbl.elf",
-        "ps7_init": "ps7_init.tcl",
-        "ps7_init_tcl": "ps7_init.tcl",
-        "xpfm": "platform.xpfm",
-        "platform": "platform.xpfm",
-        "app": "app.elf",
-        "app_elf": "app.elf",
-        "application": "app.elf",
-        "boot": "BOOT.BIN",
-        "boot_bin": "BOOT.BIN",
-        "boot.bin": "BOOT.BIN",
-    }
-    for key, (stage_name, source, sha256) in sorted(resolved.items()):
-        filename = filename_map.get(key, Path(bundle.artifacts[key]).name)
-        destination = output_dir / filename
-        _atomic_copy(source, destination)
-        item = {
-            "path": destination.relative_to(profile.root).as_posix(),
-            "source": bundle.artifacts[key],
-            "sha256": sha256,
-            "stage": stage_name,
-        }
-        published[key] = item
-        (hardware if stage_name == "hardware" else software)[key] = item
-
-    old_path = output_dir / "bundle.json"
-    old_verification: dict[str, Any] = {}
-    if old_path.is_file():
+        if not isinstance(expected, str):
+            raise BundleError(f"阶段 {owner!r} 没有记录 bundle 产物 {relative!r}")
         try:
-            old = json.loads(old_path.read_text(encoding="utf-8"))
-            if isinstance(old, Mapping) and isinstance(old.get("verification"), Mapping):
-                old_verification = dict(old["verification"])
+            actual = hash_artifact(profile.root, relative)
+        except (FingerprintError, OSError, ValueError) as exc:
+            raise BundleError(f"无法验证 bundle 源产物 {relative!r}：{exc}") from exc
+        if actual != expected:
+            raise BundleError(f"bundle 源产物哈希不匹配：{relative}")
+        resolved[key] = (owner, actual)
+
+    profile_hash = _sha256(profile.config_path)
+    identity = {
+        "profile_sha256": profile_hash,
+        "artifacts": {key: {"sha256": sha, "stage": owner,
+                            "fingerprint": records[owner].get("fingerprint")}
+                      for key, (owner, sha) in sorted(resolved.items())},
+    }
+    bundle_id = _json_sha256(identity)
+    directory = _checked_dir(profile.root, bundle.output_dir)
+    manifest_path = directory / "bundle.json"
+    previous: Mapping[str, Any] = {}
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(old, dict) and old.get("bundle_id") == bundle_id:
+                previous = old.get("verification", {}) if isinstance(old.get("verification"), dict) else {}
         except (OSError, json.JSONDecodeError):
             pass
 
+    artifacts: dict[str, dict[str, str]] = {}
+    for key, (owner, digest) in sorted(resolved.items()):
+        relative = bundle.artifacts[key]
+        filename = _FILENAMES.get(key, Path(relative).name)
+        destination = directory / filename
+        _atomic_copy(profile.root / relative, destination, digest)
+        artifacts[key] = {"path": destination.relative_to(profile.root).as_posix(),
+                          "source": relative, "sha256": digest, "stage": owner,
+                          "run_id": str(records[owner].get("run_id", "")),
+                          "fingerprint": str(records[owner].get("fingerprint", ""))}
     toolchains: dict[str, str] = {}
-    for stage_name in ("hardware", "platform", "app", "boot"):
-        record = store.successful_stage_record(manifest, stage_name)
-        values = record.get("tool_versions", {}) if isinstance(record, Mapping) else {}
+    for record in records.values():
+        values = record.get("tool_versions", {})
         if isinstance(values, Mapping):
-            for name, value in values.items():
-                if isinstance(name, str) and isinstance(value, str):
-                    toolchains[name] = value
-
-    profile_sha256 = _sha256(profile.config_path)
-    bundle_id = _json_sha256({
-        "profile_sha256": profile_sha256,
-        "artifacts": {key: item["sha256"] for key, item in sorted(published.items())},
-    })
-    payload = {
-        "schema_version": int(bundle.schema_version),
-        "bundle_id": bundle_id,
-        "profile_sha256": profile_sha256,
-        "hardware": hardware,
-        "software": software,
-        "artifacts": published,
-        "dependencies": dict(bundle.dependencies),
-        "toolchains": toolchains,
-        "verification": {
-            "jtag_deployed": bool(old_verification.get("jtag_deployed", False)),
-            "qspi_programmed": bool(old_verification.get("qspi_programmed", False)),
-            "qspi_readback_verified": bool(old_verification.get("qspi_readback_verified", False)),
-            "cold_boot_verified": bool(old_verification.get("cold_boot_verified", False)),
-        },
+            toolchains.update({str(k): str(v) for k, v in values.items()})
+    payload: dict[str, Any] = {
+        "schema_version": bundle.schema_version, "bundle_id": bundle_id,
+        "profile_sha256": profile_hash, "artifacts": artifacts,
+        "hardware": {k: v for k, v in artifacts.items() if k in {"bitstream", "xsa", "hardware_xsa"}},
+        "software": {k: v for k, v in artifacts.items() if k not in {"bitstream", "xsa", "hardware_xsa"}},
+        "dependencies": dict(bundle.dependencies), "toolchains": toolchains,
+        "verification": {key: previous.get(key) is True for key in
+                         ("jtag_deployed", "qspi_programmed", "qspi_readback_verified", "cold_boot_verified")},
     }
-    temporary = output_dir / ".bundle.json.tmp"
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, old_path)
+    _atomic_json(manifest_path, payload)
     return payload
+
+
+def resolve_bundle_artifact(profile: Any, stage: Any, relative: str) -> Path:
+    """Check a provider artifact is in the current bundle and has the recorded hash."""
+    bundle = profile.bundle
+    if bundle is None:
+        raise BundleError("profile 未配置 bundle")
+    path = bundle.output_dir / "bundle.json"
+    if path.is_symlink():
+        raise BundleError("bundle manifest 是符号链接")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BundleError(f"无法读取 bundle manifest：{exc}") from exc
+    if not isinstance(data, dict) or data.get("profile_sha256") != _sha256(profile.config_path):
+        raise BundleError("bundle profile 已变化")
+    artifacts = data.get("artifacts")
+    matches = [item for item in artifacts.values() if isinstance(item, dict) and item.get("path") == relative] if isinstance(artifacts, dict) else []
+    if len(matches) != 1:
+        raise BundleError(f"产物未被当前 bundle 唯一声明：{relative}")
+    item = matches[0]
+    needed: set[str] = set()
+    pending = list(stage.needs)
+    while pending:
+        name = pending.pop()
+        if name not in needed:
+            needed.add(name)
+            pending.extend(profile.stages[name].needs)
+    if item.get("stage") not in needed:
+        raise BundleError(f"部署阶段没有依赖产物所属阶段：{item.get('stage')}")
+    try:
+        actual = hash_artifact(profile.root, relative)
+    except (FingerprintError, OSError, ValueError) as exc:
+        raise BundleError(f"无法验证 bundle 产物：{exc}") from exc
+    if actual != item.get("sha256"):
+        raise BundleError(f"bundle 产物哈希不匹配：{relative}")
+    return profile.root / relative

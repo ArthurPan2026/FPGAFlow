@@ -121,12 +121,14 @@ def _walk_regular_files(directory: Path, base: Path) -> list[Path]:
                 if child.is_symlink():
                     raise FingerprintError(f"拒绝对文件符号链接计算哈希：{child}")
                 if child.is_file():
-                    resolved = child.resolve(strict=True)
                     try:
-                        resolved.relative_to(base)
+                        child.relative_to(base)
                     except ValueError as exc:
                         raise FingerprintError(f"输入路径超出项目根目录：{child}") from exc
-                    result.append(resolved)
+                    # The root has already been resolved, and os.walk rejects
+                    # symlink directories and files. Re-resolving every leaf
+                    # performs redundant realpath calls for large source trees.
+                    result.append(child)
     except OSError as exc:
         raise FingerprintError(f"无法枚举目录 {directory}：{exc}") from exc
     return result
@@ -145,13 +147,14 @@ def expand_inputs(
     """
     base = _root_path(root)
     selected: dict[str, Path] = {}
+    covered_directories: set[Path] = set()
     for raw_pattern in patterns:
         pattern = str(raw_pattern)
         pattern_path = Path(pattern)
         if pattern_path.is_absolute() or ".." in pattern_path.parts:
             raise FingerprintError(f"输入模式必须位于项目目录内：{pattern}")
         try:
-            matches = list(base.glob(pattern))
+            matches = sorted(base.glob(pattern), key=lambda path: (len(path.parts), path.as_posix()))
         except (OSError, ValueError) as exc:
             raise FingerprintError(f"输入 glob 模式 {pattern!r} 无效：{exc}") from exc
         if not matches and require_matches:
@@ -159,12 +162,18 @@ def expand_inputs(
         for match in matches:
             if match.is_symlink():
                 raise FingerprintError(f"拒绝使用符号链接作为输入：{match}")
+            # A matched directory already contributes its entire subtree. Glob
+            # patterns such as "src/**" also return every nested directory;
+            # walking those again makes a large source tree quadratic in depth.
+            if any(parent in covered_directories for parent in match.parents):
+                continue
             resolved = _safe_relative(base, match.relative_to(base), must_exist=True)
             if resolved.is_file():
                 selected[resolved.relative_to(base).as_posix()] = resolved
             elif resolved.is_dir():
                 for item in _walk_regular_files(resolved, base):
                     selected[item.relative_to(base).as_posix()] = item
+                covered_directories.add(match)
     return [selected[name] for name in sorted(selected)]
 
 

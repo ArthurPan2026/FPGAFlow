@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fpga_flow.fingerprint import (
     FingerprintError,
@@ -19,6 +20,19 @@ from fpga_flow.manifest import ManifestError, ManifestStore
 
 
 class FingerprintTests(unittest.TestCase):
+    def test_recursive_glob_walks_nested_tree_once_and_keeps_all_files(self) -> None:
+        from fpga_flow import fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in ("src/a/one.sv", "src/a/nested/two.sv", "src/b/three.sv"):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(relative, encoding="utf-8")
+            with patch.object(fingerprint, "_walk_regular_files", wraps=fingerprint._walk_regular_files) as walk:
+                hashes = hash_inputs(root, ["src/**", "src/a/**/*.sv"])
+            self.assertEqual(set(hashes), {"src/a/one.sv", "src/a/nested/two.sv", "src/b/three.sv"})
+            self.assertEqual(walk.call_count, 1)
+
     def test_file_and_json_hashes_are_content_sensitive_and_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

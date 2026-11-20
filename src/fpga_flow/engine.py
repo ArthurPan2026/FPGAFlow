@@ -17,7 +17,7 @@ import time
 import uuid
 
 from .config import ProfileError, topological_order
-from .bundle import refresh_bundle
+from .bundle import BundleError, artifact_producers, refresh_bundle
 from .fingerprint import (
     FingerprintError,
     expand_inputs,
@@ -629,7 +629,8 @@ class FlowEngine:
             raise FlowError("FLOW-PROVIDER-UNSUPPORTED",
                             f"阶段 {stage.name!r} 的 runner={runner!r} 不可用；不会回退到 shell 执行")
 
-    def _dispatch(self, stage: StageConfig, run_dir: Path, target: str | None) -> tuple[CommandResult, tuple[str, ...]]:
+    def _dispatch(self, stage: StageConfig, run_dir: Path, target: str | None,
+                  dependencies: Mapping[str, Any], versions: Mapping[str, str]) -> tuple[CommandResult, tuple[str, ...]]:
         runner = _runner_name(stage)
         if runner == "command":
             fields = {"root": str(self.profile.root), "out_dir": str(self.profile.output_dir),
@@ -642,6 +643,10 @@ class FlowEngine:
                 raise FlowError("FLOW-CWD-INVALID", f"阶段工作目录超出项目根目录或不存在：{stage.cwd}") from exc
             env = {key: _format_value(value, fields, f"stages.{stage.name}.env.{key}")
                    for key, value in stage.env.items()}
+            # Long-running project-owned test runners can bind each result to
+            # exactly the dependency and toolchain records verified by Flow.
+            env["FPGA_FLOW_DEPENDENCIES_JSON"] = json.dumps(dependencies, sort_keys=True)
+            env["FPGA_FLOW_TOOL_VERSIONS_JSON"] = json.dumps(versions, sort_keys=True)
             def progress(stats: Mapping[str, object]) -> None:
                 self._notify({"event": "stage_progress", "stage": stage.name,
                               "run_id": run_dir.name, **dict(stats)})
@@ -700,13 +705,6 @@ class FlowEngine:
             record["evidence"] = {}
             record["evidence_hash_error"] = str(exc)
         self.store.record_run(run_id, stage.name, record)
-        if status == "succeeded" and getattr(self.profile, "bundle", None) is not None:
-            try:
-                refresh_bundle(self.profile, self.store)
-            except Exception as exc:
-                (run_dir / "bundle-error.txt").write_text(
-                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
-                )
         if self._active_run_lock is not None:
             self._active_run_lock.clear_stage(run_id)
         if status == "succeeded":
@@ -787,7 +785,9 @@ class FlowEngine:
                 )
 
             with self._stage_target_lock(stage, selected_target, run_id):
-                command_result, command_preview = self._dispatch(stage, run_dir, selected_target)
+                if stage.kind == "deploy" and self.profile.bundle is not None:
+                    self._refresh_bundle(selected_target, required=True)
+                command_result, command_preview = self._dispatch(stage, run_dir, selected_target, dependencies, versions)
             output_text = command_result.stdout + "\n" + command_result.stderr
             if not command_result.succeeded:
                 raise FlowError(
@@ -802,6 +802,14 @@ class FlowEngine:
                        if not _marker_in_logs(run_dir, marker, output_text)]
             if missing:
                 raise FlowError("FLOW-SUCCESS-MARKER-MISSING", f"缺少成功标记：{missing}")
+            post_inputs = hash_inputs(self.profile.root, stage.inputs, require_matches=bool(stage.inputs))
+            if post_inputs != inputs:
+                raise FlowError("FLOW-INPUT-CHANGED", "阶段运行期间输入发生变化，拒绝记录成功")
+            post_dependencies, dependency_error = self._dependency_hashes(
+                stage, self.store.load(), {}, set(), selected_target
+            )
+            if post_dependencies is None or post_dependencies != dependencies:
+                raise FlowError("FLOW-DEPENDENCY-CHANGED", dependency_error or "阶段运行期间依赖发生变化")
             try:
                 concrete_outputs, _ = _expand_output_patterns(self.profile.root, stage.outputs)
                 outputs = hash_artifacts(self.profile.root, concrete_outputs)
@@ -834,6 +842,28 @@ class FlowEngine:
         if not valid or record is None:
             raise FlowError("FLOW-DEPENDENCY-STALE", f"必需阶段 {stage_name!r} 已过期：{reason}")
         return record
+
+    def _refresh_bundle(self, target: str | None, *, required: bool) -> dict[str, Any] | None:
+        """Publish only when every producer and its full dependency chain are current."""
+        if self.profile.bundle is None:
+            return None
+        try:
+            owners = artifact_producers(self.profile)
+            manifest = self.store.load()
+            memo: dict[tuple[str, str | None], tuple[bool, str, Mapping[str, Any] | None]] = {}
+            records: dict[str, Mapping[str, Any]] = {}
+            for name in sorted(set(owners.values())):
+                valid, reason, record = self._cache_state(name, manifest, memo, set(), target)
+                if not valid or record is None:
+                    if required:
+                        raise FlowError("FLOW-BUNDLE-STALE", f"bundle 阶段 {name!r} 无效：{reason}")
+                    return None
+                records[name] = record
+            return refresh_bundle(self.profile, records)
+        except FlowError:
+            raise
+        except (BundleError, FingerprintError, ManifestError, OSError, ValueError) as exc:
+            raise FlowError("FLOW-BUNDLE-INVALID", str(exc)) from exc
 
     def _resource_keys(self, stage: StageConfig, target: str | None) -> set[str]:
         keys = {f"resource:{item}" for item in stage.resources}
@@ -991,6 +1021,7 @@ class FlowEngine:
                 order, execute, target=selected_target, force=force,
                 allow_side_effects=allow_side_effects,
             )
+            self._refresh_bundle(selected_target, required=False)
             return {"status": "succeeded", "operation": "build", "project": self.profile.project_name,
                     "target": selected_target, "stages": completed}
 
@@ -1074,6 +1105,12 @@ class FlowEngine:
             matching_deploy = self._select_deploy_stages(selected_target, deploy_stage) if deploy and selected_target else []
             if deploy:
                 self._check_destructive(matching_deploy, allow_destructive)
+                for name in matching_deploy:
+                    stage = self.profile.stages[name]
+                    options = dict(self.profile.targets.get(stage.target or selected_target, {}))
+                    options.update(stage.options)
+                    if _runner_name(stage) == "amd.qspi.program" and options.get("verify") is not True:
+                        raise FlowError("FLOW-RELEASE-QSPI-VERIFY", "发布 QSPI 必须启用读回校验")
             selected = [name for name, stage in self.profile.stages.items()
                         if stage.kind in {"build", "test", "validate"}
                         and (selected_target is None or stage.target is None or stage.target == selected_target)]
@@ -1104,6 +1141,7 @@ class FlowEngine:
                 order, selected, target=selected_target, force=force,
                 allow_side_effects=allow_side_effects, deploy_barrier=barrier if deploy else set(),
             )
+            self._refresh_bundle(selected_target, required=False)
             return {"status": "succeeded", "operation": "release", "project": self.profile.project_name,
                     "target": selected_target, "deploy_requested": deploy,
                     "deploy_stage": matching_deploy[0] if matching_deploy else None, "stages": results}

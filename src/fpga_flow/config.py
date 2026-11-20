@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from .models import BundleConfig, FlowConfig, StageConfig, ToolchainConfig
+from .bundle import BundleError, artifact_producers
 
 
 SUPPORTED_SCHEMA_VERSION = 1
@@ -79,18 +80,20 @@ def _reject_symlink_components(root: Path, parts: Sequence[str], where: str) -> 
 
 def _reject_symlink_glob_matches(root: Path, pattern: Path, where: str) -> None:
     """规范化 glob 配置路径前，拒绝已存在的符号链接匹配项。"""
+    checked_components: set[Path] = {root}
     for match in glob.glob(str(pattern), recursive=True):
         lexical = Path(match)
         try:
             relative = lexical.relative_to(root)
         except ValueError as exc:
             raise ProfileError(f"{where} 的 glob 匹配到了项目根目录之外的路径：{match}") from exc
-        _reject_symlink_components(root, PurePosixPath(relative.as_posix()).parts, where)
-        resolved = lexical.resolve(strict=False)
-        try:
-            resolved.relative_to(root)
-        except ValueError as exc:
-            raise ProfileError(f"{where} 的 glob 解析到了项目根目录之外：{match}") from exc
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current not in checked_components:
+                if _path_is_link(current):
+                    raise ProfileError(f"{where} 遍历了符号链接或目录联接：{current}")
+                checked_components.add(current)
 
 
 def _relative_path(
@@ -226,7 +229,7 @@ def load_profile(config_path: str | Path) -> FlowConfig:
     bundle: BundleConfig | None = None
     raw_bundle = raw.get("bundle")
     if raw_bundle is not None:
-        bundle_table = _table(raw_bundle, "bundle")
+        bundle_table = _table(raw_bundle, "bundle", allowed={"schema_version", "output_dir", "artifacts", "dependencies"})
         bundle_schema = bundle_table.get("schema_version", 3)
         if type(bundle_schema) is not int or bundle_schema != 3:
             raise ProfileError("bundle.schema_version 必须为 3")
@@ -374,6 +377,10 @@ def load_profile(config_path: str | Path) -> FlowConfig:
     )
     # 校验所有阶段，包括当前选择的套件无法到达的循环依赖。
     topological_order(config, tuple(stages))
+    try:
+        artifact_producers(config)
+    except BundleError as exc:
+        raise ProfileError(str(exc)) from exc
     return config
 
 

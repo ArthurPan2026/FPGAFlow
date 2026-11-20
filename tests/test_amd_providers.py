@@ -176,7 +176,8 @@ class AMDProviderTests(unittest.TestCase):
                 "if '-jtagtargets' in sys.argv:\n"
                 " print('2 board-serial-1 (name arm_dap idcode 4ba00477)')\n"
                 " raise SystemExit(0)\n"
-                "print('Verify Operation successful.')\n",
+                "print('Verify Operation successful.')\n"
+                "print('Flash Operation Successful')\n",
                 encoding="utf-8",
             )
             stage = StageConfig(
@@ -199,6 +200,16 @@ class AMDProviderTests(unittest.TestCase):
             result = QSPIProgramProvider().execute(stage, profile, run_dir, "board-a")
             self.assertTrue(result.succeeded, result.stderr)
             self.assertIn("-verify", result.command)
+
+            fake.write_text(
+                "import sys\n"
+                "if '-jtagtargets' in sys.argv:\n"
+                " print('2 board-serial-1 (name arm_dap idcode 4ba00477)')\n"
+                " raise SystemExit(0)\n"
+                "print('Verify Operation successful.')\n", encoding="utf-8")
+            result = QSPIProgramProvider().execute(stage, profile, run_dir, "board-a")
+            self.assertFalse(result.succeeded)
+            self.assertIn("编程成功标记", result.error)
 
     def test_jtag_provider_rejects_artifacts_not_owned_by_prerequisite_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

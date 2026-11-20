@@ -22,6 +22,7 @@ from ..amd_deploy import (
     select_unique_flash_target,
 )
 from ..fingerprint import FingerprintError, hash_artifact
+from ..bundle import BundleError, resolve_bundle_artifact
 from ..models import FlowConfig, StageConfig
 from ..runner import CommandResult, run_command
 
@@ -47,6 +48,13 @@ def _relative_artifact(value: Any, stage: StageConfig, profile: FlowConfig) -> t
     raw = PurePosixPath(pattern)
     if raw.is_absolute() or ".." in raw.parts or "\\" in pattern:
         raise AMDProviderError(f"产物路径超出项目目录：{pattern!r}")
+    if profile.bundle is not None:
+        if any(char in pattern for char in "*?[]"):
+            raise AMDProviderError("bundle 部署产物必须使用确定的路径")
+        try:
+            return resolve_bundle_artifact(profile, stage, pattern), pattern
+        except BundleError as exc:
+            raise AMDProviderError(str(exc)) from exc
     matches = sorted((p for p in profile.root.glob(pattern) if p.is_file() and not p.is_symlink()), key=lambda p: p.as_posix())
     if len(matches) != 1:
         raise AMDProviderError(f"产物选择器必须恰好匹配一个文件：{pattern!r}，实际匹配 {len(matches)} 个")
@@ -216,8 +224,10 @@ class QSPIProgramProvider:
             return CommandResult(tuple(query), profile.root, query_result.started_at_utc,
                                  _now(), query_result.elapsed_seconds, 2, False,
                                  query_result.stdout, f"{exc}\n", str(exc))
-        verify = bool(options.get("verify", False))
-        blank_check = bool(options.get("blank_check", True))
+        verify = options.get("verify", False)
+        blank_check = options.get("blank_check", True)
+        if type(verify) is not bool or type(blank_check) is not bool:
+            raise AMDProviderError("verify 与 blank_check 必须为布尔值")
         selection = {"status": "selected", "target": dict(selected), "targets": targets,
                      "boot_image": image_rel, "fsbl": fsbl_rel,
                      "offset": offset, "flash_type": str(options["flash_type"]),
@@ -233,6 +243,14 @@ class QSPIProgramProvider:
                                       timeout_seconds=stage.timeout_seconds,
                                       log_dir=run_dir / "program")
         output_text = program_result.stdout + "\n" + program_result.stderr
+        program_marker = str(options.get("program_marker", "Flash Operation Successful"))
+        if program_result.succeeded and program_marker not in output_text:
+            return CommandResult(tuple(command), profile.root, query_result.started_at_utc,
+                                 program_result.completed_at_utc,
+                                 query_result.elapsed_seconds + program_result.elapsed_seconds,
+                                 1, False, program_result.stdout,
+                                 program_result.stderr + f"\n缺少必需的编程成功标记：{program_marker}\n",
+                                 f"缺少必需的编程成功标记：{program_marker}")
         verify_marker = str(options.get("verify_marker", "Verify Operation successful"))
         if verify and program_result.succeeded and verify_marker not in output_text:
             return CommandResult(tuple(command), profile.root, query_result.started_at_utc,

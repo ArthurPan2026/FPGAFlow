@@ -13,7 +13,7 @@ python -m pip install .
 fpga-flow --help
 ```
 
-核心只依赖 Python 标准库，要求 Python 3.11 或更新版本。使用 UART provider 时安装可选依赖：
+核心只依赖 Python 标准库，要求 Python 3.15 或更新版本。使用 UART provider 时安装可选依赖：
 
 ```sh
 python -m pip install ".[uart]"
