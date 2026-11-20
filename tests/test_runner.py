@@ -12,6 +12,11 @@ from fpga_flow.runner import run_command
 
 
 class CommandRunnerTests(unittest.TestCase):
+    def test_default_progress_interval_is_twenty_seconds(self) -> None:
+        import inspect
+        parameter = inspect.signature(run_command).parameters["progress_interval_seconds"]
+        self.assertEqual(parameter.default, 20.0)
+
     def test_runs_argv_without_shell_and_records_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

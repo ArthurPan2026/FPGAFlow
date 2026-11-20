@@ -17,10 +17,12 @@ import time
 import uuid
 
 from .config import ProfileError, topological_order
-from .bundle import BundleError, artifact_producers, refresh_bundle
+from .bundle import BundleError, artifact_producers, record_bundle_cold_boot, record_bundle_deployment, refresh_bundle
+from .external import ExternalDependencyError, dependency_path, stage_external_hashes
 from .fingerprint import (
     FingerprintError,
     expand_inputs,
+    hash_artifact,
     hash_artifacts,
     hash_inputs,
     sha256_file,
@@ -116,7 +118,7 @@ def _stage_contract(profile: FlowConfig, stage: StageConfig, target: str | None)
         cwd = stage.cwd.relative_to(profile.root).as_posix()
     except ValueError:
         cwd = str(stage.cwd)
-    return {
+    contract = {
         "name": stage.name, "kind": stage.kind, "runner": _runner_name(stage),
         "options": dict(_stage_options(stage)), "needs": list(stage.needs),
         "inputs": list(stage.inputs), "outputs": list(stage.outputs),
@@ -140,6 +142,21 @@ def _stage_contract(profile: FlowConfig, stage: StageConfig, target: str | None)
         "target_profile": _target_profile_fingerprint(profile, stage, target),
         "destructive": stage.destructive,
     }
+    if stage.external_inputs:
+        contract["external_inputs"] = {
+            name: {"revision": profile.external_dependencies[name].revision,
+                   "inputs": list(profile.external_dependencies[name].inputs),
+                   "ignored_committed_paths": list(profile.external_dependencies[name].ignored_committed_paths),
+                   "environment_variable": profile.external_dependencies[name].environment_variable}
+            for name in stage.external_inputs
+        }
+    return contract
+
+
+def _stage_input_hashes(profile: FlowConfig, stage: StageConfig) -> dict[str, str]:
+    inputs = hash_inputs(profile.root, stage.inputs, require_matches=bool(stage.inputs))
+    inputs.update(stage_external_hashes(profile, stage.external_inputs))
+    return dict(sorted(inputs.items()))
 
 
 def _format_value(value: str, fields: Mapping[str, str], where: str) -> str:
@@ -351,6 +368,8 @@ class FlowEngine:
         previous_wait = self._wait_lock_current
         self._active_run_lock = lock
         self._wait_lock_current = wait_lock
+        with self._session_lock:
+            self._completed_in_session.clear()
         try:
             yield lock
         finally:
@@ -590,7 +609,7 @@ class FlowEngine:
             memo[memo_key] = result
             return result
         try:
-            inputs = hash_inputs(self.profile.root, stage.inputs, require_matches=bool(stage.inputs))
+            inputs = _stage_input_hashes(self.profile, stage)
             fingerprint = stage_fingerprint(
                 _stage_contract(self.profile, stage, context_target),
                 inputs, dependency_hashes, versions,
@@ -643,6 +662,14 @@ class FlowEngine:
                 raise FlowError("FLOW-CWD-INVALID", f"阶段工作目录超出项目根目录或不存在：{stage.cwd}") from exc
             env = {key: _format_value(value, fields, f"stages.{stage.name}.env.{key}")
                    for key, value in stage.env.items()}
+            for name in stage.external_inputs:
+                dependency = self.profile.external_dependencies[name]
+                variable = dependency.environment_variable
+                if variable:
+                    resolved = str(dependency_path(dependency))
+                    if variable in env and Path(env[variable]).expanduser().resolve() != Path(resolved):
+                        raise FlowError("FLOW-EXTERNAL-PATH", f"外部依赖 {name!r} 的环境变量与其校验路径不一致")
+                    env[variable] = resolved
             # Long-running project-owned test runners can bind each result to
             # exactly the dependency and toolchain records verified by Flow.
             env["FPGA_FLOW_DEPENDENCIES_JSON"] = json.dumps(dependencies, sort_keys=True)
@@ -750,7 +777,7 @@ class FlowEngine:
         self._notify({"event": "stage_started", "stage": stage.name, "run_id": run_id,
                       "target": selected_target, "kind": stage.kind})
         try:
-            inputs = hash_inputs(self.profile.root, stage.inputs, require_matches=bool(stage.inputs))
+            inputs = _stage_input_hashes(self.profile, stage)
             versions, details = self._probe_stage_toolchains(stage, run_dir)
             manifest = self.store.load()
             dependencies, dependency_error = self._dependency_hashes(
@@ -786,7 +813,11 @@ class FlowEngine:
 
             with self._stage_target_lock(stage, selected_target, run_id):
                 if stage.kind == "deploy" and self.profile.bundle is not None:
-                    self._refresh_bundle(selected_target, required=True)
+                    bundle = self._refresh_bundle(selected_target, required=True)
+                    if bundle is None:
+                        raise FlowError("FLOW-BUNDLE-STALE", "部署前没有当前 bundle")
+                    _write_json(run_dir / "bundle-selection.json", {
+                        "bundle_id": bundle["bundle_id"], "artifacts": bundle["artifacts"]})
                 command_result, command_preview = self._dispatch(stage, run_dir, selected_target, dependencies, versions)
             output_text = command_result.stdout + "\n" + command_result.stderr
             if not command_result.succeeded:
@@ -802,7 +833,7 @@ class FlowEngine:
                        if not _marker_in_logs(run_dir, marker, output_text)]
             if missing:
                 raise FlowError("FLOW-SUCCESS-MARKER-MISSING", f"缺少成功标记：{missing}")
-            post_inputs = hash_inputs(self.profile.root, stage.inputs, require_matches=bool(stage.inputs))
+            post_inputs = _stage_input_hashes(self.profile, stage)
             if post_inputs != inputs:
                 raise FlowError("FLOW-INPUT-CHANGED", "阶段运行期间输入发生变化，拒绝记录成功")
             post_dependencies, dependency_error = self._dependency_hashes(
@@ -823,6 +854,7 @@ class FlowEngine:
             )
         except Exception as exc:
             error = exc if isinstance(exc, FlowError) else FlowError(
+                "FLOW-EXTERNAL-DEPENDENCY" if isinstance(exc, ExternalDependencyError) else
                 "FLOW-STAGE-FAILED", f"{type(exc).__name__}：{exc}"
             )
             if not (run_dir / "stderr.log").is_file() or not (run_dir / "command.json").is_file():
@@ -864,6 +896,51 @@ class FlowEngine:
             raise
         except (BundleError, FingerprintError, ManifestError, OSError, ValueError) as exc:
             raise FlowError("FLOW-BUNDLE-INVALID", str(exc)) from exc
+
+    def _record_deployments(self, records: Sequence[Mapping[str, Any]]) -> None:
+        if self.profile.bundle is None:
+            return
+        for record in records:
+            name = str(record.get("stage", ""))
+            stage = self.profile.stages.get(name)
+            if stage is None or stage.kind != "deploy" or record.get("status") != "succeeded":
+                continue
+            runner = _runner_name(stage)
+            if runner not in {"amd.qspi.program", "amd.zynq.jtag"}:
+                continue
+            run_id = str(record.get("run_id", ""))
+            try:
+                selection = json.loads((self.store.run_path(run_id).parent / "bundle-selection.json").read_text(encoding="utf-8"))
+                options = dict(self.profile.targets.get(stage.target or "", {}))
+                options.update(stage.options)
+                record_bundle_deployment(self.profile, str(selection["bundle_id"]), runner,
+                                         verify=options.get("verify") is True, run_id=run_id)
+            except (BundleError, FingerprintError, ManifestError, OSError, ValueError, KeyError) as exc:
+                raise FlowError("FLOW-BUNDLE-DEPLOY-RECORD",
+                                f"部署已执行，但无法保存 bundle 验证记录；请检查运行 {run_id}：{exc}") from exc
+
+    def _record_validations(self, records: Sequence[Mapping[str, Any]]) -> None:
+        if self.profile.bundle is None:
+            return
+        for record in records:
+            stage = self.profile.stages.get(str(record.get("stage", "")))
+            if stage is None or stage.kind != "validate" or stage.options.get("bundle_verification") != "cold_boot_verified":
+                continue
+            run_id = str(record.get("run_id", ""))
+            relative = stage.options.get("bundle_evidence")
+            outputs = record.get("outputs")
+            try:
+                if not isinstance(relative, str) or not isinstance(outputs, Mapping) or relative not in outputs:
+                    raise BundleError("冷启动报告未作为验证阶段产物记录")
+                if hash_artifact(self.profile.root, relative) != outputs[relative]:
+                    raise BundleError("冷启动报告哈希不匹配")
+                report = json.loads((self.profile.root / relative).read_text(encoding="utf-8"))
+                if not isinstance(report, dict) or report.get("status") != "passed" or report.get("cold_boot_verified") is not True:
+                    raise BundleError("冷启动报告没有通过")
+                record_bundle_cold_boot(self.profile, str(report.get("bundle_id", "")), run_id)
+            except (BundleError, FingerprintError, OSError, ValueError) as exc:
+                raise FlowError("FLOW-BUNDLE-VALIDATION-RECORD",
+                                f"验证已执行，但无法保存 bundle 验证记录；请检查运行 {run_id}：{exc}") from exc
 
     def _resource_keys(self, stage: StageConfig, target: str | None) -> set[str]:
         keys = {f"resource:{item}" for item in stage.resources}
@@ -1044,6 +1121,7 @@ class FlowEngine:
                 order, selected, target=selected_target, force=force,
                 allow_side_effects=allow_side_effects,
             )
+            self._record_validations(results)
             return {"status": "succeeded", "operation": "validate", "suite": suite,
                     "project": self.profile.project_name, "target": selected_target, "stages": results}
 
@@ -1089,6 +1167,7 @@ class FlowEngine:
                 order, selected, target=selected_target, force=True,
                 allow_side_effects=allow_side_effects,
             )
+            self._record_deployments(results)
             return {"status": "succeeded", "operation": "deploy", "project": self.profile.project_name,
                     "target": selected_target, "deploy_stage": selected[0], "stages": results}
 
@@ -1111,8 +1190,22 @@ class FlowEngine:
                     options.update(stage.options)
                     if _runner_name(stage) == "amd.qspi.program" and options.get("verify") is not True:
                         raise FlowError("FLOW-RELEASE-QSPI-VERIFY", "发布 QSPI 必须启用读回校验")
+            def has_deployment_ancestor(name: str) -> bool:
+                pending = list(self.profile.stages[name].needs)
+                visited: set[str] = set()
+                while pending:
+                    dependency = pending.pop()
+                    if dependency in visited:
+                        continue
+                    visited.add(dependency)
+                    if self.profile.stages[dependency].kind == "deploy":
+                        return True
+                    pending.extend(self.profile.stages[dependency].needs)
+                return False
+
             selected = [name for name, stage in self.profile.stages.items()
                         if stage.kind in {"build", "test", "validate"}
+                        and not has_deployment_ancestor(name)
                         and (selected_target is None or stage.target is None or stage.target == selected_target)]
             if deploy:
                 selected.extend(matching_deploy)
@@ -1142,6 +1235,7 @@ class FlowEngine:
                 allow_side_effects=allow_side_effects, deploy_barrier=barrier if deploy else set(),
             )
             self._refresh_bundle(selected_target, required=False)
+            self._record_deployments(results)
             return {"status": "succeeded", "operation": "release", "project": self.profile.project_name,
                     "target": selected_target, "deploy_requested": deploy,
                     "deploy_stage": matching_deploy[0] if matching_deploy else None, "stages": results}

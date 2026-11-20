@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from .models import BundleConfig, FlowConfig, StageConfig, ToolchainConfig
+from .models import BundleConfig, ExternalDependencyConfig, FlowConfig, StageConfig, ToolchainConfig
 from .bundle import BundleError, artifact_producers
 
 
@@ -16,14 +16,14 @@ SUPPORTED_SCHEMA_VERSION = 1
 STAGE_KINDS = frozenset({"build", "test", "validate", "deploy"})
 STAGE_RUNNERS = frozenset({"command", "amd.zynq.jtag", "amd.qspi.program", "amd.uart.commands"})
 DEFAULT_OUTPUT_DIR = "out/fpga-flow"
-_TOP_KEYS = {"schema_version", "project", "flow", "toolchains", "targets", "stages", "suites", "bundle"}
+_TOP_KEYS = {"schema_version", "project", "flow", "toolchains", "targets", "stages", "suites", "bundle", "external_dependencies"}
 _PROJECT_KEYS = {"name", "description"}
 _FLOW_KEYS = {"output_dir", "default_target", "max_parallel_stages"}
 _TOOLCHAIN_KEYS = {"command", "version_args", "expected_version", "version_command", "failure_markers"}
 _STAGE_KEYS = {
     "kind", "needs", "inputs", "outputs", "command", "cwd", "toolchains",
     "env", "timeout_seconds", "success_markers", "failure_markers",
-    "side_effects", "resources", "target", "destructive", "description", "runner", "options",
+    "side_effects", "resources", "target", "destructive", "description", "runner", "options", "external_inputs",
 }
 
 
@@ -81,7 +81,7 @@ def _reject_symlink_components(root: Path, parts: Sequence[str], where: str) -> 
 def _reject_symlink_glob_matches(root: Path, pattern: Path, where: str) -> None:
     """规范化 glob 配置路径前，拒绝已存在的符号链接匹配项。"""
     checked_components: set[Path] = {root}
-    for match in glob.glob(str(pattern), recursive=True):
+    for match in glob.iglob(str(pattern), recursive=True):
         lexical = Path(match)
         try:
             relative = lexical.relative_to(root)
@@ -226,6 +226,34 @@ def load_profile(config_path: str | Path) -> FlowConfig:
     if default_target is not None and default_target not in targets:
         raise ProfileError(f"flow.default_target 引用了未知目标 {default_target!r}")
 
+    raw_external = _table(raw.get("external_dependencies", {}), "external_dependencies")
+    external_dependencies: dict[str, ExternalDependencyConfig] = {}
+    for name, value in raw_external.items():
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise ProfileError(f"外部依赖名称无效：{name!r}")
+        definition = _table(value, f"external_dependencies.{name}",
+                            allowed={"path", "revision", "inputs", "environment_variable", "ignored_committed_paths"})
+        path_text = _string(definition.get("path"), f"external_dependencies.{name}.path")
+        if chr(0) in path_text:
+            raise ProfileError(f"external_dependencies.{name}.path 不能包含 NUL")
+        path_value = Path(path_text).expanduser()
+        external_path = (path_value if path_value.is_absolute() else root / path_value).resolve(strict=False)
+        revision = _string(definition.get("revision"), f"external_dependencies.{name}.revision").lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision):
+            raise ProfileError(f"external_dependencies.{name}.revision 必须是完整 Git 提交标识")
+        patterns = _strings(definition.get("inputs"), f"external_dependencies.{name}.inputs")
+        if not patterns:
+            raise ProfileError(f"external_dependencies.{name}.inputs 不能为空")
+        ignored_paths = _strings(definition.get("ignored_committed_paths", []), f"external_dependencies.{name}.ignored_committed_paths")
+        for pattern in (*patterns, *ignored_paths):
+            rel = PurePosixPath(pattern)
+            if rel.is_absolute() or ".." in rel.parts or "\\" in pattern or chr(0) in pattern:
+                raise ProfileError(f"外部依赖输入必须是仓库内的 POSIX 路径：{pattern!r}")
+        variable = definition.get("environment_variable")
+        if variable is not None and (not isinstance(variable, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable)):
+            raise ProfileError(f"external_dependencies.{name}.environment_variable 无效")
+        external_dependencies[name] = ExternalDependencyConfig(name, external_path, revision, patterns, variable, ignored_paths)
+
     bundle: BundleConfig | None = None
     raw_bundle = raw.get("bundle")
     if raw_bundle is not None:
@@ -336,6 +364,7 @@ def load_profile(config_path: str | Path) -> FlowConfig:
             description=stage_description,
             runner=runner,
             options=options,
+            external_inputs=_strings(definition.get("external_inputs", []), f"stages.{name}.external_inputs"),
         )
 
     for name, stage in stages.items():
@@ -345,6 +374,9 @@ def load_profile(config_path: str | Path) -> FlowConfig:
         for toolchain in stage.toolchains:
             if toolchain not in toolchains:
                 raise ProfileError(f"stages.{name}.toolchains 引用了未知工具链 {toolchain!r}")
+        for dependency in stage.external_inputs:
+            if dependency not in external_dependencies:
+                raise ProfileError(f"stages.{name}.external_inputs 引用了未知依赖 {dependency!r}")
 
     raw_suites = _table(raw.get("suites", {}), "suites")
     suites: dict[str, tuple[str, ...]] = {}
@@ -374,6 +406,7 @@ def load_profile(config_path: str | Path) -> FlowConfig:
         stages=MappingProxyType(stages),
         suites=MappingProxyType(suites),
         bundle=bundle,
+        external_dependencies=MappingProxyType(external_dependencies),
     )
     # 校验所有阶段，包括当前选择的套件无法到达的循环依赖。
     topological_order(config, tuple(stages))

@@ -36,6 +36,25 @@ Vivado、Vitis、XSCT、Bootgen 和板卡驱动仍需单独安装和授权。
 
 阶段命令按 argv 数组执行，不经过 shell。只有被 profile 声明的输入和依赖产物会参与阶段指纹。工具专属的增量构建逻辑留在外部工程脚本中。
 
+外部 Git 依赖可以声明完整提交和需要读取的文件。阶段用 `external_inputs` 引用依赖。检查缓存时，Flow 会检查工作树、提交和文件哈希；执行阶段前后也会再次检查。示例中的提交标识需要替换成实际值。
+
+```toml
+[external_dependencies.video_core]
+path = "../video-core"
+revision = "0123456789abcdef0123456789abcdef01234567"
+inputs = ["rtl/**", "ip_repo/**"]
+environment_variable = "VIDEO_CORE_REPO"
+ignored_committed_paths = ["README.md", "docs/*.md"]
+
+[stages.hardware]
+kind = "build"
+external_inputs = ["video_core"]
+command = ["python", "scripts/build.py"]
+outputs = ["out/hardware/design.bit"]
+```
+
+`ignored_committed_paths` 只允许锁定提交之后、且仅改动所列路径的后续提交。工作树仍须干净。声明的外部文件内容进入阶段指纹和 bundle；源码发生变化时，旧结果不会命中缓存。
+
 ## 常用命令
 
 ```sh
@@ -52,7 +71,7 @@ fpga-flow deploy --config fpga-flow.toml --target zybo_z7_20 --stage deploy_jtag
 fpga-flow release --config fpga-flow.toml --target zybo_z7_20
 ```
 
-`plan`、`status`、`resume` 和 `watch` 都不会启动工具链或写板。JSON 模式的成功和失败结果都写到 stdout；阶段摘要默认只返回输入、输出、证据数量，完整哈希映射仍保存在 run 记录中。需要展开哈希时加 `--details`；长任务进度写到 stderr，失败仍返回非零退出码。
+`plan`、`status`、`resume` 和 `watch` 不会启动 FPGA 工具链或写板。检查外部依赖时会调用只读 Git 命令。JSON 模式的成功和失败结果都写到 stdout；阶段摘要默认只返回输入、输出、证据数量，完整哈希映射保存在 run 记录中。需要展开哈希时加 `--details`；长任务进度写到 stderr，失败返回非零退出码。
 
 `resume` 汇总当前阶段、缓存和失败记录，并给出完整的下一步命令。它只提供建议，不会自动执行。长任务在运行时持续写入 stdout/stderr 日志；`watch` 可显示心跳和日志尾部。运行 ID 会在阶段开始时报告。
 
@@ -83,6 +102,6 @@ CI 在 Ubuntu 和 Windows 运行同一套测试。主机回归、RTL 仿真、UA
 
 ## Bundle 与发布产物
 
-profile 可以声明 bundle。阶段完成且所有声明产物的输入指纹和输出哈希都有效时，FPGAFlow 会在 out/current/ 生成统一文件和 bundle.json。bundle.json 使用 schema 3，记录 profile hash、硬件和软件产物 hash、依赖摘要、工具版本和部署验证状态。部署 provider 只应引用 bundle 或阶段声明的产物。
+profile 可以声明 bundle。所有产物的阶段、依赖和哈希均有效时，FPGAFlow 在配置的输出目录生成文件和 `bundle.json`。清单使用 schema 3，记录 profile 哈希、产物哈希、外部依赖、工具版本和验证状态。部署前，Flow 再次检查 bundle 和产物。
 
-QSPI provider 的 verify 默认由 profile 决定。开发 profile 可以关闭读回校验以缩短迭代；发布 profile 应单独声明 verify=true，并通过显式 release 部署阶段执行。
+QSPI provider 的 `verify` 默认由 profile 决定。开发阶段可以关闭读回校验；`release --deploy` 对 QSPI 强制要求 `verify = true`。编程、读回和冷启动的记录分别保存。依赖部署的板级检查需要显式运行，不会随 `release` 自动执行。

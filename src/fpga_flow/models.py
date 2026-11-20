@@ -17,6 +17,16 @@ class ToolchainConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ExternalDependencyConfig:
+    name: str
+    path: Path
+    revision: str
+    inputs: tuple[str, ...]
+    environment_variable: str | None = None
+    ignored_committed_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StageConfig:
     name: str
     kind: str
@@ -37,6 +47,7 @@ class StageConfig:
     description: str = ""
     runner: str = "command"
     options: Mapping[str, Any] = field(default_factory=dict)
+    external_inputs: tuple[str, ...] = ()
 
 
 
@@ -61,3 +72,4 @@ class FlowConfig:
     suites: Mapping[str, tuple[str, ...]]
     max_parallel_stages: int = 1
     bundle: BundleConfig | None = None
+    external_dependencies: Mapping[str, ExternalDependencyConfig] = field(default_factory=dict)

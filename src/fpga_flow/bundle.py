@@ -145,11 +145,13 @@ def refresh_bundle(profile: Any, records: Mapping[str, Mapping[str, Any]]) -> di
     directory = _checked_dir(profile.root, bundle.output_dir)
     manifest_path = directory / "bundle.json"
     previous: Mapping[str, Any] = {}
+    previous_evidence: Mapping[str, Any] = {}
     if manifest_path.is_file() and not manifest_path.is_symlink():
         try:
             old = json.loads(manifest_path.read_text(encoding="utf-8"))
             if isinstance(old, dict) and old.get("bundle_id") == bundle_id:
                 previous = old.get("verification", {}) if isinstance(old.get("verification"), dict) else {}
+                previous_evidence = old.get("verification_evidence", {}) if isinstance(old.get("verification_evidence"), dict) else {}
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -164,6 +166,20 @@ def refresh_bundle(profile: Any, records: Mapping[str, Mapping[str, Any]]) -> di
                           "run_id": str(records[owner].get("run_id", "")),
                           "fingerprint": str(records[owner].get("fingerprint", ""))}
     toolchains: dict[str, str] = {}
+    external: dict[str, dict[str, Any]] = {}
+    for name, dependency in profile.external_dependencies.items():
+        prefix = f"@external/{name}/"
+        selected: dict[str, str] = {}
+        for record in records.values():
+            inputs = record.get("inputs", {})
+            if isinstance(inputs, Mapping):
+                for path, digest in inputs.items():
+                    if isinstance(path, str) and path.startswith(prefix) and isinstance(digest, str):
+                        selected[path[len(prefix):]] = digest
+        if selected:
+            external[name] = {"locked_revision": dependency.revision,
+                              "selected_content_sha256": _json_sha256(selected),
+                              "inputs": dict(sorted(selected.items()))}
     for record in records.values():
         values = record.get("tool_versions", {})
         if isinstance(values, Mapping):
@@ -174,8 +190,10 @@ def refresh_bundle(profile: Any, records: Mapping[str, Mapping[str, Any]]) -> di
         "hardware": {k: v for k, v in artifacts.items() if k in {"bitstream", "xsa", "hardware_xsa"}},
         "software": {k: v for k, v in artifacts.items() if k not in {"bitstream", "xsa", "hardware_xsa"}},
         "dependencies": dict(bundle.dependencies), "toolchains": toolchains,
+        "external_dependencies": external,
         "verification": {key: previous.get(key) is True for key in
                          ("jtag_deployed", "qspi_programmed", "qspi_readback_verified", "cold_boot_verified")},
+        "verification_evidence": dict(previous_evidence),
     }
     _atomic_json(manifest_path, payload)
     return payload
@@ -216,3 +234,64 @@ def resolve_bundle_artifact(profile: Any, stage: Any, relative: str) -> Path:
     if actual != item.get("sha256"):
         raise BundleError(f"bundle 产物哈希不匹配：{relative}")
     return profile.root / relative
+
+
+def record_bundle_deployment(profile: Any, bundle_id: str, runner: str,
+                             *, verify: bool, run_id: str) -> None:
+    """Bind a successful provider run to the bundle whose files were used."""
+    bundle = profile.bundle
+    if bundle is None:
+        return
+    path = bundle.output_dir / "bundle.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BundleError(f"无法读取已部署 bundle：{exc}") from exc
+    if not isinstance(data, dict) or data.get("bundle_id") != bundle_id:
+        raise BundleError("bundle 身份在部署期间发生变化")
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise BundleError("bundle 产物清单无效")
+    for item in artifacts.values():
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise BundleError("bundle 产物记录无效")
+        if hash_artifact(profile.root, item["path"]) != item.get("sha256"):
+            raise BundleError(f"部署期间 bundle 产物发生变化：{item['path']}")
+    verification = data.setdefault("verification", {})
+    evidence = data.setdefault("verification_evidence", {})
+    if not isinstance(verification, dict) or not isinstance(evidence, dict):
+        raise BundleError("bundle 验证记录无效")
+    if runner == "amd.qspi.program":
+        verification.update({"qspi_programmed": True, "qspi_readback_verified": verify,
+                             "cold_boot_verified": False})
+        evidence.update({"qspi_programmed": run_id, "qspi_readback_verified": run_id if verify else None,
+                         "cold_boot_verified": None})
+    elif runner == "amd.zynq.jtag":
+        verification["jtag_deployed"] = True
+        evidence["jtag_deployed"] = run_id
+    else:
+        return
+    _atomic_json(path, data)
+
+
+def record_bundle_cold_boot(profile: Any, bundle_id: str, run_id: str) -> None:
+    """Record an explicitly validated cold-boot report for the same bundle."""
+    bundle = profile.bundle
+    if bundle is None:
+        raise BundleError("profile 未配置 bundle")
+    path = bundle.output_dir / "bundle.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BundleError(f"无法读取 bundle：{exc}") from exc
+    if not isinstance(data, dict) or data.get("bundle_id") != bundle_id:
+        raise BundleError("冷启动报告与当前 bundle 不匹配")
+    verification = data.get("verification")
+    evidence = data.setdefault("verification_evidence", {})
+    if not isinstance(verification, dict) or not isinstance(evidence, dict):
+        raise BundleError("bundle 验证记录无效")
+    if verification.get("qspi_programmed") is not True or verification.get("qspi_readback_verified") is not True:
+        raise BundleError("当前 bundle 缺少 QSPI 读回验证")
+    verification["cold_boot_verified"] = True
+    evidence["cold_boot_verified"] = run_id
+    _atomic_json(path, data)

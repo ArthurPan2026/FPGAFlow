@@ -164,6 +164,38 @@ class EngineIntegrationTests(unittest.TestCase):
         profile = _write_profile(self.root, stages, **kwargs)
         return FlowEngine(load_profile(profile))
 
+    def test_release_does_not_run_board_checks_for_an_unselected_deployment(self) -> None:
+        stages = {
+            "hardware": _count_stage("out/hardware.bit"),
+            "deploy_jtag": {"kind": "deploy", "needs": ["hardware"], "target": "zybo",
+                "command": [sys.executable, "tools/fake_stage.py", "target", "out/jtag", "{target}"],
+                "outputs": ["out/jtag"]},
+            "runtime": {"kind": "validate", "needs": ["deploy_jtag"], "target": "zybo",
+                "command": [sys.executable, "tools/fake_stage.py", "target", "out/runtime", "{target}"],
+                "outputs": ["out/runtime"]},
+        }
+        engine = self._engine(stages)
+        result = engine.release(target="zybo")
+        self.assertEqual([item["stage"] for item in result["stages"]], ["hardware"])
+        self.assertFalse((self.root / "out/jtag").exists())
+        self.assertFalse((self.root / "out/runtime").exists())
+
+    def test_runtime_evidence_is_not_reused_across_api_operations(self) -> None:
+        stages = {
+            "health": {"kind": "validate", "target": "zybo",
+                "command": [sys.executable, "tools/fake_stage.py", "target", "out/health", "{target}"],
+                "outputs": ["out/health"]},
+            "audio": {"kind": "validate", "needs": ["health"], "target": "zybo",
+                "command": [sys.executable, "tools/fake_stage.py", "target", "out/audio", "{target}"],
+                "outputs": ["out/audio"]},
+        }
+        engine = self._engine(stages, suites={"health": ["health"], "audio": ["audio"]})
+        engine.validate("health")
+        with self.assertRaises(FlowError) as caught:
+            engine.validate("audio")
+        self.assertEqual(caught.exception.code, "FLOW-DEPENDENCY-STALE")
+        self.assertFalse((self.root / "out/audio").exists())
+
     def test_plan_is_read_only_and_launches_no_stage_or_toolchain_commands(self) -> None:
         engine = self._engine({"hardware": _count_stage("out/hardware.bit")})
         result = engine.plan(target="zybo")

@@ -153,8 +153,16 @@ class ZynqJTAGProvider:
             ps_init_commands=init_commands,
         ), encoding="utf-8", newline="\n")
         command = [*_toolchain_prefix(stage, profile, "xsct"), str(script)]
-        return run_command(command, cwd=profile.root, env=stage.env,
-                           timeout_seconds=stage.timeout_seconds)
+        result = run_command(command, cwd=profile.root, env=stage.env,
+                             timeout_seconds=stage.timeout_seconds)
+        required_markers = ("PL_CONFIGURED", "PS_INITIALIZED", "APP_ELF_DOWNLOADED", "APP_RUNNING")
+        missing_markers = [marker for marker in required_markers if marker not in result.stdout]
+        if result.succeeded and missing_markers:
+            message = "JTAG 输出缺少必需标记：" + ", ".join(missing_markers)
+            return CommandResult(result.command, result.cwd, result.started_at_utc,
+                                 result.completed_at_utc, result.elapsed_seconds,
+                                 1, False, result.stdout, result.stderr + "\n" + message, message)
+        return result
 
 
 class QSPIProgramProvider:

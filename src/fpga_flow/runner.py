@@ -104,7 +104,7 @@ def run_command(
     timeout_seconds: float | None = None,
     log_dir: Path | None = None,
     on_progress: Callable[[Mapping[str, object]], None] | None = None,
-    progress_interval_seconds: float = 5.0,
+    progress_interval_seconds: float = 20.0,
     capture_limit_bytes: int = DEFAULT_CAPTURE_LIMIT_BYTES,
 ) -> CommandResult:
     """直接执行 argv；stdout/stderr 在进程运行时持续写入日志文件。"""

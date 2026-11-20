@@ -56,7 +56,8 @@ class AMDProviderTests(unittest.TestCase):
             root = Path(tmp)
             self._artifacts(root)
             fake = root / "fake_xsct.py"
-            fake.write_text("import sys; print('XSCT_OK'); print(sys.argv[1])\n", encoding="utf-8")
+            fake.write_text("import sys; print('XSCT_OK'); print(sys.argv[1]); "
+                            "print('PL_CONFIGURED\\nPS_INITIALIZED\\nAPP_ELF_DOWNLOADED\\nAPP_RUNNING')\n", encoding="utf-8")
             stage = StageConfig(
                 "deploy_jtag", "deploy", ("hardware", "platform", "app"),
                 ("out/hardware/design.bit", "out/platform/ps-init.tcl", "out/app/application.elf"),
