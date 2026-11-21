@@ -210,6 +210,7 @@ class EngineIntegrationTests(unittest.TestCase):
         first_run_id = first["stages"][0]["run_id"]
         first_run_dir = engine.store.run_path(first_run_id).parent
         self.assertEqual(json.loads((first_run_dir / "run.json").read_text(encoding="utf-8"))["run_id"], first_run_id)
+        self.assertEqual(engine.store.read_run_record(first_run_id)["fpga_flow_version"], "0.2.0")
         self.assertEqual(json.loads((first_run_dir / "command.json").read_text(encoding="utf-8"))["argv"][0], sys.executable)
         self.assertEqual((self.root / "out/counter.txt").read_text(encoding="utf-8"), "1")
         second = engine.build("hardware")

@@ -1,107 +1,85 @@
 # FPGAFlow
 
-FPGAFlow 是一套面向 AMD Vivado/Vitis 工程的项目无关 CLI。核心处理阶段依赖、内容哈希、缓存、运行记录、工具预检和部署保护。外部工程在自己的仓库维护 profile、构建脚本、板卡身份和验收规则。
+FPGAFlow 是可独立安装、与具体 FPGA 工程解耦的 Python CLI，用于执行工程 profile 中声明的构建、验证和部署阶段。项目仓库维护自己的 Vivado/Vitis 输入、脚本、配置和产物；FPGAFlow 作为外部工具安装在开发主机。
 
-目前支持 Linux 和 Windows 主机，提供 argv 命令执行器、Vivado/Vitis 工具检查、Zynq JTAG、QSPI 和 UART provider。工具核心不包含任何外部工程的源码路径、ROM 路径、应用协议或应用数据。
+## 安装与版本
 
-FPGAFlow 的仓库内容只定义通用 schema、调度器、provider、缓存和示例 profile。具体工程名称、应用参数、存储路径、板级验收命令和部署策略必须留在外部工程 profile 中。
+当前版本为 0.2.0，Python 要求为 3.15 或更新版本。构建 wheel 与 source distribution 的发布流程由版本标签触发，产物发布在 GitHub Releases。
 
-## 安装
-
-```sh
-python -m pip install .
-fpga-flow --help
-```
-
-核心只依赖 Python 标准库，要求 Python 3.15 或更新版本。使用 UART provider 时安装可选依赖：
+下载适用于目标版本的 wheel 后安装：
 
 ```sh
-python -m pip install ".[uart]"
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install ./fpga_flow-0.2.0-py3-none-any.whl
+fpga-flow --version
 ```
 
-Vivado、Vitis、XSCT、Bootgen 和板卡驱动仍需单独安装和授权。
-
-## 项目配置
-
-每个外部工程在项目根目录维护 `fpga-flow.toml`。配置声明输入、产物、阶段依赖图、工具版本、目标、资源锁和测试规则。所有项目路径都相对于 profile 所在目录，并使用正斜线。
-
-`flow.max_parallel_stages` 默认值为 1。项目可提高并行上限，并用阶段的 `resources` 声明共享资源。Flow 还会锁住同一工具链、同一板卡身份和相互覆盖的输出路径。
-
-`side_effects` 用来声明会影响项目外部状态的阶段，例如持久存储写入。运行这类阶段必须显式传入 `--allow-side-effects`。破坏性部署仍需 `--allow-destructive`。
-
-示例配置：
-
-- `examples/zynq7000-rtl-ps/flow.toml` 展示 RTL + PS 流程。
-- `examples/zynq7000-hls-ps/flow.toml` 展示 HLS、PL、PS、启动镜像和 QSPI 阶段。
-
-阶段命令按 argv 数组执行，不经过 shell。只有被 profile 声明的输入和依赖产物会参与阶段指纹。工具专属的增量构建逻辑留在外部工程脚本中。
-
-外部 Git 依赖可以声明完整提交和需要读取的文件。阶段用 `external_inputs` 引用依赖。检查缓存时，Flow 会检查工作树、提交和文件哈希；执行阶段前后也会再次检查。示例中的提交标识需要替换成实际值。
-
-```toml
-[external_dependencies.video_core]
-path = "../video-core"
-revision = "0123456789abcdef0123456789abcdef01234567"
-inputs = ["rtl/**", "ip_repo/**"]
-environment_variable = "VIDEO_CORE_REPO"
-ignored_committed_paths = ["README.md", "docs/*.md"]
-
-[stages.hardware]
-kind = "build"
-external_inputs = ["video_core"]
-command = ["python", "scripts/build.py"]
-outputs = ["out/hardware/design.bit"]
-```
-
-`ignored_committed_paths` 只允许锁定提交之后、且仅改动所列路径的后续提交。工作树仍须干净。声明的外部文件内容进入阶段指纹和 bundle；源码发生变化时，旧结果不会命中缓存。
-
-## 常用命令
+Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。使用 UART provider 时安装 pySerial：
 
 ```sh
-fpga-flow doctor --config fpga-flow.toml --stage hardware
+python -m pip install "pyserial>=3.5"
+```
+
+Vivado、Vitis、XSCT、Bootgen 和板卡驱动独立安装，并按工程要求锁定版本。
+
+## 工程 profile
+
+每个工程在自己的仓库维护 `fpga-flow.toml`，声明阶段依赖图、工具版本、目标板、输入、产物和运行规则。所有项目路径相对于 profile 所在目录，并使用正斜线。
+
+```sh
 fpga-flow plan --config fpga-flow.toml --target zybo_z7_20
-fpga-flow resume --config fpga-flow.toml --json
-fpga-flow watch --config fpga-flow.toml --run-id RUN_ID --follow
-fpga-flow history --config fpga-flow.toml --limit 20
 fpga-flow build --config fpga-flow.toml --stage hardware
 fpga-flow build --config fpga-flow.toml --stage app --with-deps
 fpga-flow validate --config fpga-flow.toml --suite host
-fpga-flow validate --config fpga-flow.toml --suite board --allow-side-effects
+```
+
+Flow 按 argv 执行 profile 命令并记录工具版本、输入哈希、产物哈希、运行日志和阶段结果。stage 的具体构建规则留在工程仓库；硬件工具的 GUI 工程仍由 Vivado 或 Vitis 管理。
+
+## 主机本地配置
+
+工具安装路径、板卡连接地址和串口属于开发主机配置。将它们写入与 profile 并列的 `fpga-flow.local.toml`，该文件适合加入项目的本地忽略规则：
+
+```toml
+[toolchains.vivado]
+command = "/tools/AMDDesignTools/2025.2.1/Vivado/bin/vivado"
+
+[toolchains.vitis]
+command = "/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis"
+version_command = ["/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis", "--version"]
+
+[targets.zybo_z7_20]
+hw_server_url = "tcp:127.0.0.1:3121"
+
+[targets.zybo_z7_20.uart]
+port = "/dev/serial/by-id/replace-with-board-adapter"
+```
+
+也可以通过 `FPGA_FLOW_LOCAL_CONFIG` 指定本地主机 overlay 文件。Overlay 支持调整 toolchain 命令、目标连接参数和阶段环境变量；项目硬件身份、阶段图、输入与产物仍由版本管理的 profile 定义。
+
+## 外部依赖与部署
+
+外部源码依赖使用完整 Git commit 和输入文件模式锁定。阶段执行前后会校验依赖提交与工作树，依赖输入哈希进入阶段指纹。
+
+`side_effects` 用于声明会影响工程或板卡外部状态的阶段。持久存储写入需要显式授权；破坏性部署使用 `--allow-destructive`。部署、验证和构建记录分别保存在每次运行的不可变记录中。
+
+常用命令：
+
+```sh
+fpga-flow --version
+fpga-flow doctor --config fpga-flow.toml --stage hardware
+fpga-flow resume --config fpga-flow.toml --json
+fpga-flow watch --config fpga-flow.toml --run-id RUN_ID --follow
+fpga-flow history --config fpga-flow.toml --limit 20
 fpga-flow deploy --config fpga-flow.toml --target zybo_z7_20 --stage deploy_jtag --allow-destructive
 fpga-flow release --config fpga-flow.toml --target zybo_z7_20
 ```
 
-`plan`、`status`、`resume` 和 `watch` 不会启动 FPGA 工具链或写板。检查外部依赖时会调用只读 Git 命令。JSON 模式的成功和失败结果都写到 stdout；阶段摘要默认只返回输入、输出、证据数量，完整哈希映射保存在 run 记录中。需要展开哈希时加 `--details`；长任务进度写到 stderr，失败返回非零退出码。
-
-`resume` 汇总当前阶段、缓存和失败记录，并给出完整的下一步命令。它只提供建议，不会自动执行。长任务在运行时持续写入 stdout/stderr 日志；`watch` 可显示心跳和日志尾部。运行 ID 会在阶段开始时报告。
-
-`doctor --stage` 或 `doctor --suite` 只检查所选阶段需要的工具链和只读硬件预检。JTAG 预检只查询目标，QSPI 预检只查询 Flash 目标，UART 预检只枚举设备，不打开串口或发送数据。未指定范围时检查所选目标的完整 profile。
-
-同一输出目录只允许一个变更操作同时运行。Flow 默认立即报告锁持有者；需要等待时显式使用 `--wait-lock`。阶段 DAG 默认串行；profile 可提高并行上限。部署、验证与工具共享资源时，Flow 会按锁配置串行执行。
-
-## 记录与迁移
-
-`out/fpga-flow/manifest.json` 是紧凑的当前状态索引。每次操作的输入哈希、产物哈希、命令和日志引用保存在不可变的 `out/fpga-flow/runs/<run_id>/run.json` 中。
-
-首次写入时，Flow 会把旧版 manifest 原样归档，再迁移到紧凑格式。旧 run 记录不会删除。可用 `history` 按阶段查看记录。
-
-## Agent 与 AMD Ross
-
-AMD Ross 文档搜索和 Vivado MCP 适合查询官方资料、检查打开的 Vivado 工程和交互调试。FPGAFlow Skill 指导智能体调用统一 CLI。智能体在上下文中断后先运行 `resume --json`，再用 `watch` 查看正在运行的任务或失败日志。聊天记录不是构建事实来源。
-
-参考：[AMD Ross 产品页](https://www.amd.com/en/products/software/ross-agentic-ai.html)、[AMD Ross 官方仓库](https://github.com/Xilinx/ross-ai-assistant)。
-
-## 验证边界
+## 开发与发布
 
 ```sh
 python -m unittest discover -s tests -v
+python -m build
 ```
 
-CI 在 Ubuntu 和 Windows 运行同一套测试。主机回归、RTL 仿真、UART 状态、QSPI 读回和画面目视验收分别记录。UART 或仿真通过不能代替画面验收。
-
-
-## Bundle 与发布产物
-
-profile 可以声明 bundle。所有产物的阶段、依赖和哈希均有效时，FPGAFlow 在配置的输出目录生成文件和 `bundle.json`。清单使用 schema 3，记录 profile 哈希、产物哈希、外部依赖、工具版本和验证状态。部署前，Flow 再次检查 bundle 和产物。
-
-QSPI provider 的 `verify` 默认由 profile 决定。开发阶段可以关闭读回校验；`release --deploy` 对 QSPI 强制要求 `verify = true`。编程、读回和冷启动的记录分别保存。依赖部署的板级检查需要显式运行，不会随 `release` 自动执行。
+发布工作流校验 tag 与包版本，运行单元测试，构建 wheel 和 source distribution，验证安装后的 CLI，并将安装包附加到版本 Release。FPGAFlow 仓库保持项目无关；具体 FPGA 项目的 profile 和源文件由各项目仓库管理。

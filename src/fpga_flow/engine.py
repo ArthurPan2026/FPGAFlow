@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 
+from . import __version__ as FPGA_FLOW_VERSION
 from .config import ProfileError, topological_order
 from .bundle import BundleError, artifact_producers, record_bundle_cold_boot, record_bundle_deployment, refresh_bundle
 from .external import ExternalDependencyError, dependency_path, stage_external_hashes
@@ -710,6 +711,7 @@ class FlowEngine:
         run_dir = self.store.run_path(run_id).parent
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION, "run_id": run_id,
+            "fpga_flow_version": FPGA_FLOW_VERSION,
             "stage": stage.name, "kind": stage.kind,
             "status": status, "target": target, "fingerprint": fingerprint,
             "inputs": dict(inputs), "dependencies": dict(dependencies),

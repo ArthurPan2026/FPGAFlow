@@ -438,6 +438,38 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "字符串数组"):
             self._load_text(source)
 
+
+    def test_local_overlay_changes_tool_commands_and_board_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "fpga-flow.toml"
+            local = root / "fpga-flow.local.toml"
+            config.write_text(NON_HLS_PROFILE, encoding="utf-8")
+            local.write_text(
+                '[toolchains.vivado]\ncommand = "/opt/amd/Vivado/bin/vivado"\n'
+                '[targets.zybo.uart]\nport = "/dev/serial/by-id/board-a"\n'
+                '[stages.board_smoke.env]\nFPGA_UART_DEVICE = "/dev/ttyUSB4"\n',
+                encoding="utf-8",
+            )
+            profile = load_profile(config)
+            self.assertEqual(profile.toolchains["vivado"].command,
+                             ("/opt/amd/Vivado/bin/vivado",))
+            self.assertEqual(profile.targets["zybo"]["uart"]["port"],
+                             "/dev/serial/by-id/board-a")
+            self.assertEqual(profile.stages["board_smoke"].env["FPGA_UART_DEVICE"], "/dev/ttyUSB4")
+            self.assertEqual(profile.targets["zybo"]["part"], "xc7z020clg400-1")
+
+    def test_local_overlay_cannot_change_hardware_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "fpga-flow.toml"
+            local = root / "fpga-flow.local.toml"
+            config.write_text(NON_HLS_PROFILE, encoding="utf-8")
+            local.write_text('[targets.zybo]\npart = "xc7z010clg400-1"\n',
+                             encoding="utf-8")
+            with self.assertRaisesRegex(ProfileError, "不支持的键"):
+                load_profile(config)
+
     def test_unknown_toolchain_and_target_references_fail(self) -> None:
         source = NON_HLS_PROFILE.replace('toolchains = ["vivado"]', 'toolchains = ["missing"]', 1)
         with self.assertRaisesRegex(ProfileError, "未知工具链"):

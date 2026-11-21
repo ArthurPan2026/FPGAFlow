@@ -7,6 +7,8 @@ import sys
 import time
 from typing import Any, Sequence
 
+from . import __version__
+
 lazy from .config import ProfileError
 lazy from .engine import FlowEngine, FlowError
 lazy from .fingerprint import FingerprintError
@@ -27,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(prog="fpga-flow", description="AMD FPGA 构建、验证与板级流程工具")
     parser._positionals.title = "命令"
     parser._optionals.title = "选项"
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", default="fpga-flow.toml", help="项目 profile 文件")
     parser.add_argument("--json", dest="json_output", action="store_true", help="输出机器可读 JSON")
     parser.add_argument("--details", action="store_true",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import glob
+import os
 import re
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -149,8 +150,65 @@ def _string_table(value: object, where: str) -> Mapping[str, str]:
     return MappingProxyType(dict(table))
 
 
+def _load_local_overrides(path: Path, base: dict[str, Any]) -> None:
+    """Load host-specific executable and board transport overrides."""
+    configured = os.environ.get("FPGA_FLOW_LOCAL_CONFIG")
+    local_path = Path(configured).expanduser() if configured else path.with_name("fpga-flow.local.toml")
+    if not local_path.is_absolute():
+        local_path = path.parent / local_path
+    if not local_path.is_file():
+        if configured:
+            raise ProfileError(f"本地覆盖配置不存在：{local_path.resolve()}")
+        return
+    try:
+        with local_path.open("rb") as stream:
+            local = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ProfileError(f"无法读取本地覆盖配置 {local_path.resolve()}：{exc}") from exc
+
+    unknown = sorted(set(local) - {"toolchains", "targets", "stages"})
+    if unknown:
+        raise ProfileError("本地覆盖配置只允许 toolchains、targets 和 stages：" + ", ".join(unknown))
+
+    for name, values in _table(local.get("toolchains", {}), "local.toolchains").items():
+        if name not in base.get("toolchains", {}):
+            raise ProfileError(f"本地覆盖引用了未知工具链：{name}")
+        overrides = _table(values, f"local.toolchains.{name}",
+                           allowed={"command", "version_args", "version_command"})
+        base["toolchains"][name].update(overrides)
+
+    for name, values in _table(local.get("targets", {}), "local.targets").items():
+        if name not in base.get("targets", {}):
+            raise ProfileError(f"本地覆盖引用了未知目标：{name}")
+        target_values = _table(values, f"local.targets.{name}",
+                               allowed={"hw_server_url", "uart", "jtag"})
+        destination = base["targets"][name]
+        if "hw_server_url" in target_values:
+            destination["hw_server_url"] = target_values["hw_server_url"]
+        for section in ("uart", "jtag"):
+            if section not in target_values:
+                continue
+            values = _table(target_values[section], f"local.targets.{name}.{section}")
+            current = destination.get(section, {})
+            if not isinstance(current, dict):
+                current = {}
+            current.update(values)
+            destination[section] = current
+
+    for name, values in _table(local.get("stages", {}), "local.stages").items():
+        if name not in base.get("stages", {}):
+            raise ProfileError(f"本地覆盖引用了未知阶段：{name}")
+        overrides = _table(values, f"local.stages.{name}", allowed={"env"})
+        if "env" in overrides:
+            current = base["stages"][name].get("env", {})
+            if not isinstance(current, dict):
+                current = {}
+            current.update(_string_table(overrides["env"], f"local.stages.{name}.env"))
+            base["stages"][name]["env"] = current
+
+
 def load_profile(config_path: str | Path) -> FlowConfig:
-    """解析 TOML 配置，解析安全路径，并校验阶段依赖图。"""
+    """解析公共 TOML 与可选的本机覆盖，并校验阶段依赖图。"""
     path = Path(config_path).expanduser().resolve()
     if not path.is_file():
         raise ProfileError(f"配置文件不存在：{path}")
@@ -159,6 +217,7 @@ def load_profile(config_path: str | Path) -> FlowConfig:
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ProfileError(f"无法读取配置文件 {path}：{exc}") from exc
+    _load_local_overrides(path, raw)
 
     extras = sorted(set(raw) - _TOP_KEYS)
     if extras:
