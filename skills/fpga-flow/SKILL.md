@@ -5,11 +5,11 @@ description: 使用 fpga-flow 在 AMD Vivado/Vitis 工程中执行可重复的�
 
 # FPGAFlow Agent 操作指南
 
-对已配置的工程，使用消费项目自己的 `fpga-flow.toml` 和 FPGAFlow CLI。不要把项目路径、板卡规则或命令复制到 FPGAFlow 核心。
+对已配置的工程，使用消费项目自己的 `fpga-project.toml` 和 FPGAFlow CLI。不要把项目路径、板卡规则或命令复制到 FPGAFlow 核心。
 
 ## 恢复上下文
 
-1. 先运行 `fpga-flow resume --config fpga-flow.toml --json`。
+1. 先运行 `fpga-flow resume --project fpga-project.toml --json`。
 2. 如果有活动 run，按返回的命令运行 `watch`；如果有失败 run，先查看日志尾部。
 3. 按 resume 返回的下一步命令继续。resume 只给建议，不会执行命令。
 4. 需要重新核对环境时，按目标阶段运行 `doctor --stage <name>` 或 `doctor --suite <name>`。

@@ -11,6 +11,8 @@ from typing import Any, Mapping, Sequence
 
 from .models import BundleConfig, ExternalDependencyConfig, FlowConfig, StageConfig, ToolchainConfig
 from .bundle import BundleError, artifact_producers
+from .project import ProjectDescriptor, ProjectError, default_state_dir, load_project
+from .profiles import load_project_profile
 
 
 SUPPORTED_SCHEMA_VERSION = 1
@@ -150,10 +152,19 @@ def _string_table(value: object, where: str) -> Mapping[str, str]:
     return MappingProxyType(dict(table))
 
 
-def _load_local_overrides(path: Path, base: dict[str, Any]) -> None:
+def _load_local_overrides(
+    path: Path,
+    base: dict[str, Any],
+    *,
+    default_path: Path | None = None,
+) -> None:
     """Load host-specific executable and board transport overrides."""
     configured = os.environ.get("FPGA_FLOW_LOCAL_CONFIG")
-    local_path = Path(configured).expanduser() if configured else path.with_name("fpga-flow.local.toml")
+    local_path = (
+        Path(configured).expanduser()
+        if configured
+        else default_path or path.with_name("fpga-flow.local.toml")
+    )
     if not local_path.is_absolute():
         local_path = path.parent / local_path
     if not local_path.is_file():
@@ -217,7 +228,20 @@ def load_profile(config_path: str | Path) -> FlowConfig:
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ProfileError(f"无法读取配置文件 {path}：{exc}") from exc
-    _load_local_overrides(path, raw)
+    project_descriptor: ProjectDescriptor | None = None
+    project_table = raw.get("project")
+    if "stages" not in raw and isinstance(project_table, dict) and "profile" in project_table:
+        try:
+            project_descriptor = load_project(path)
+            raw = load_project_profile(project_descriptor)
+        except ProjectError as exc:
+            raise ProfileError(str(exc)) from exc
+    local_config = (
+        default_state_dir(project_descriptor) / "fpga-flow.local.toml"
+        if project_descriptor is not None
+        else None
+    )
+    _load_local_overrides(path, raw, default_path=local_config)
 
     extras = sorted(set(raw) - _TOP_KEYS)
     if extras:
@@ -466,6 +490,8 @@ def load_profile(config_path: str | Path) -> FlowConfig:
         suites=MappingProxyType(suites),
         bundle=bundle,
         external_dependencies=MappingProxyType(external_dependencies),
+        state_dir=default_state_dir(project_descriptor) if project_descriptor else None,
+        project_descriptor=project_descriptor,
     )
     # 校验所有阶段，包括当前选择的套件无法到达的循环依赖。
     topological_order(config, tuple(stages))

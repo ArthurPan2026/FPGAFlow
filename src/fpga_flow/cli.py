@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import time
 from typing import Any, Sequence
@@ -30,7 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser._positionals.title = "命令"
     parser._optionals.title = "选项"
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--config", default="fpga-flow.toml", help="项目 profile 文件")
+    parser.add_argument("--config", default=None, help="兼容模式的完整 Flow profile 文件")
+    parser.add_argument("--project", default=None, help="声明式 FPGA 项目清单")
     parser.add_argument("--json", dest="json_output", action="store_true", help="输出机器可读 JSON")
     parser.add_argument("--details", action="store_true",
                         help="完整展开输入、输出和证据哈希；默认只返回数量")
@@ -40,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub._positionals.title = "位置参数"
         sub._optionals.title = "选项"
         sub.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        sub.add_argument("--project", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         sub.add_argument("--json", dest="json_output", action="store_true", default=argparse.SUPPRESS,
                          help="输出机器可读 JSON")
         sub.add_argument("--details", action="store_true", default=argparse.SUPPRESS,
@@ -48,6 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
     def mutating(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--wait-lock", action="store_true",
                          help="项目输出目录被占用时等待；默认立即报告锁持有者")
+
+    inventory = subparsers.add_parser("inventory", help="解析项目配置与 Vivado XPR 并生成源码清单")
+    common(inventory)
+    mutating(inventory)
+
+    migration = subparsers.add_parser("migrate-hardware", help="核验旧硬件运行证据并迁移")
+    common(migration)
+    migration.add_argument("--legacy-run", required=True)
+    migration.add_argument("--proof", required=True)
 
     for name in ("doctor", "plan", "status", "resume"):
         sub = subparsers.add_parser(name, help=f"查看 {name} 状态")
@@ -184,6 +196,9 @@ def _human(result: dict[str, Any], action: str) -> None:
         for run in result.get("runs", []):
             print(f"  {run.get('run_id')} {run.get('stage')} {_human_label(run.get('status'))} "
                   f"{run.get('elapsed_seconds') or '-'} s {run.get('error_code') or ''}")
+    elif action == "inventory":
+        print(f"项目 inventory 已生成：{result.get('path')}")
+        print(f"  源文件={result.get('source_count', 0)}，测试台={result.get('test_count', 0)}")
     else:
         print(f"{action}：{_human_label(result.get('status'))} 目标={result.get('target') or '-'}")
         for stage in result.get("stages", []):
@@ -236,12 +251,22 @@ def _compact_json_result(value: Any) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.config and args.project:
+        parser.error("--config 和 --project 不能同时指定")
+    config_path = args.project or args.config
+    if config_path is None:
+        config_path = "fpga-project.toml" if Path("fpga-project.toml").is_file() else "fpga-flow.toml"
     as_json = bool(getattr(args, "json_output", False))
     # Progress is written to stderr, so JSON stdout remains parseable while long runs stay visible.
     progress = _progress
     try:
-        engine = FlowEngine.from_file(args.config, providers=builtin_providers(), progress_callback=progress)
-        if args.action == "doctor":
+        engine = FlowEngine.from_file(config_path, providers=builtin_providers(), progress_callback=progress)
+        if args.action == "inventory":
+            result = engine.write_project_inventory(wait_lock=args.wait_lock)
+        elif args.action == "migrate-hardware":
+            from .migration import migrate_hardware
+            result = dict(migrate_hardware(engine, Path(args.legacy_run), Path(args.proof)))
+        elif args.action == "doctor":
             result = engine.doctor(target=args.target, stage=args.stage, suite=args.suite,
                                    wait_lock=args.wait_lock)
         elif args.action == "plan":

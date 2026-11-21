@@ -18,4 +18,4 @@ fpga-flow = "fpga_flow.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-fpga_flow = ["schema/*.json"]
+fpga_flow = ["schema/*.json", "profiles/*.toml"]

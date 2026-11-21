@@ -1,0 +1,194 @@
+# Built-in Zynq-7000 Vitis profile; project paths come from fpga-project.toml.
+schema_version = 1
+
+[project]
+name = "zynq7000-vitis"
+description = "Zynq-7000 Vivado and Vitis project profile"
+
+[flow]
+output_dir = "build/fpga-flow"
+default_target = "board"
+max_parallel_stages = 2
+
+[bundle]
+schema_version = 3
+output_dir = "build/fpga-flow/current"
+
+[bundle.artifacts]
+bitstream = "build/fpga-flow/artifacts/bitstream.bit"
+xsa = "build/fpga-flow/artifacts/hardware.xsa"
+fsbl = "build/fpga-flow/artifacts/fsbl.elf"
+ps7_init = "build/fpga-flow/artifacts/ps7_init.tcl"
+app = "build/fpga-flow/artifacts/app.elf"
+boot_bin = "build/fpga-flow/artifacts/BOOT.BIN"
+
+[bundle.dependencies]
+
+[toolchains.python]
+command = ["python3.15"]
+version_args = ["--version"]
+expected_version = "Python 3.15.2"
+
+[toolchains.vivado]
+command = ["vivado"]
+version_args = ["-version"]
+expected_version = "vivado v{vivado_version}"
+
+[toolchains.vitis]
+command = ["vitis"]
+version_command = ["vitis", "--version"]
+expected_version = "Vitis v{vitis_version}"
+
+[toolchains.xsct]
+command = ["xsct"]
+version_command = ["xsct", "-eval", "puts [version]; exit"]
+expected_version = "xsct {vitis_version}"
+
+[toolchains.program_flash]
+command = ["program_flash"]
+version_command = ["vitis", "-version"]
+expected_version = "Vitis v{vitis_version}"
+
+[targets.board]
+family = "amd-zynq-7000"
+
+[targets.board.uart]
+baudrate = 115200
+prompt_regex = '>\s*$'
+
+[stages.hardware]
+outputs = ["build/fpga-flow/artifacts/bitstream.bit", "build/fpga-flow/artifacts/hardware.xsa", "build/fpga-flow/backend/hardware.json", "build/fpga-flow/vivado/hardware/reports/timing_summary.rpt", "build/fpga-flow/vivado/hardware/reports/drc.rpt", "build/fpga-flow/vivado/hardware/reports/qor_gate.tsv"]
+kind = "build"
+inputs = ["@project.hardware"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 21600
+description = "调用项目硬件后端构建 PL bitstream 与 XSA"
+
+[stages.platform]
+outputs = ["build/fpga-flow/artifacts/platform.xpfm", "build/fpga-flow/artifacts/fsbl.elf", "build/fpga-flow/artifacts/ps7_init.tcl", "build/fpga-flow/backend/platform.json"]
+kind = "build"
+needs = ["hardware"]
+env = { FPGA_FLOW_VITIS_VERSION = "{vitis_version}" }
+inputs = ["@project.platform"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado", "vitis"]
+timeout_seconds = 14400
+description = "基于当前 XSA 构建 PS platform、BSP、FSBL 与初始化脚本"
+
+[stages.app]
+outputs = ["build/fpga-flow/artifacts/app.elf", "build/fpga-flow/backend/app.json"]
+kind = "build"
+needs = ["platform"]
+inputs = ["@project.application"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado", "vitis"]
+timeout_seconds = 7200
+description = "构建 PS 应用 ELF；应用改动沿用对应 XPFM 的 Ninja 缓存"
+
+[stages.boot]
+outputs = ["build/fpga-flow/artifacts/BOOT.BIN", "build/fpga-flow/backend/boot.json"]
+kind = "build"
+needs = ["hardware", "platform", "app"]
+inputs = []
+command = ["python3", "--version"]
+toolchains = ["python", "vivado", "vitis"]
+timeout_seconds = 1800
+description = "生成与当前 bitstream、FSBL 和 app ELF 匹配的启动镜像"
+
+[stages.host_regression]
+outputs = ["build/fpga-flow/tests/host/unittest.log"]
+kind = "test"
+inputs = []
+command = ["python3", "--version"]
+toolchains = ["python"]
+timeout_seconds = 1800
+description = "运行项目 host C 回归"
+
+[stages.rtl_project]
+outputs = ["build/fpga-flow/tests/vivado-rtl/gba-zynq7020-rtl.xpr", "build/fpga-flow/tests/vivado-rtl/gba-zynq7020-rtl.srcs/sources_1/bd/zynq_gba_system/zynq_gba_system.bd"]
+kind = "test"
+inputs = ["@project.hardware"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 7200
+description = "生成独立的 Vivado RTL 仿真工程"
+
+[stages.rtl_smoke]
+outputs = ["build/fpga-flow/tests/rtl/smoke/seed-1/current/*/xsim.log"]
+kind = "test"
+needs = ["rtl_project"]
+inputs = ["@project.tests:smoke"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 7200
+description = "运行声明式 RTL smoke suite，按 bench 记录并可恢复"
+
+[stages.rtl_memory]
+outputs = ["build/fpga-flow/tests/rtl/memory/seed-1/current/*/xsim.log"]
+kind = "test"
+needs = ["rtl_project"]
+inputs = ["@project.tests:memory"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 7200
+
+[stages.rtl_cpu]
+outputs = ["build/fpga-flow/tests/rtl/cpu/seed-1/current/*/xsim.log"]
+kind = "test"
+needs = ["rtl_project"]
+inputs = ["@project.tests:cpu"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 7200
+
+[stages.rtl_system]
+outputs = ["build/fpga-flow/tests/rtl/system/seed-1/current/*/xsim.log"]
+kind = "test"
+needs = ["rtl_project"]
+inputs = ["@project.tests:system"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 14400
+
+[stages.deploy_jtag]
+kind = "deploy"
+needs = ["hardware", "platform", "app", "boot"]
+target = "board"
+toolchains = ["xsct"]
+runner = "amd.zynq.jtag"
+destructive = true
+timeout_seconds = 180
+description = "联合复位、配置 PL、初始化 PS 并下载 app"
+options = { bitstream = "build/fpga-flow/current/bitstream.bit", ps_init_script = "build/fpga-flow/current/ps7_init.tcl", elf = "build/fpga-flow/current/app.elf", run_ms = 1000, ps_target_pattern = "APU", cpu_target_pattern = "ARM Cortex-A9 MPCore #0", ps_init_commands = ["ps7_init", "ps7_post_config"] }
+
+[stages.deploy_qspi]
+kind = "deploy"
+needs = ["boot", "platform"]
+target = "board"
+toolchains = ["program_flash"]
+runner = "amd.qspi.program"
+destructive = true
+timeout_seconds = 900
+description = "在显式确认后编程指定 QSPI 区段；默认不做读回校验"
+options = { boot_image = "build/fpga-flow/current/BOOT.BIN", fsbl = "build/fpga-flow/current/fsbl.elf", offset = 0, verify = false }
+
+[stages.deploy_qspi_release]
+kind = "deploy"
+needs = ["boot", "platform"]
+target = "board"
+toolchains = ["program_flash"]
+runner = "amd.qspi.program"
+destructive = true
+side_effects = ["persistent-storage"]
+timeout_seconds = 900
+description = "发布 QSPI 编程，强制执行读回校验"
+options = { boot_image = "build/fpga-flow/current/BOOT.BIN", fsbl = "build/fpga-flow/current/fsbl.elf", offset = 0, verify = true }
+
+[suites]
+host = ["host_regression"]
+rtl-smoke = ["rtl_project", "rtl_smoke"]
+rtl-memory = ["rtl_project", "rtl_memory"]
+rtl-cpu = ["rtl_project", "rtl_cpu"]
+rtl-system = ["rtl_project", "rtl_system"]
+rtl = ["rtl_project", "rtl_smoke", "rtl_memory", "rtl_cpu", "rtl_system"]

@@ -73,3 +73,5 @@ class FlowConfig:
     max_parallel_stages: int = 1
     bundle: BundleConfig | None = None
     external_dependencies: Mapping[str, ExternalDependencyConfig] = field(default_factory=dict)
+    state_dir: Path | None = None
+    project_descriptor: Any | None = None

@@ -25,27 +25,28 @@ Vivado、Vitis、XSCT、Bootgen 和板卡驱动独立安装，并按工程要求
 
 ## 工程 profile
 
-每个工程在自己的仓库维护 `fpga-flow.toml`，声明阶段依赖图、工具版本、目标板、输入、产物和运行规则。所有项目路径相对于 profile 所在目录，并使用正斜线。
+消费项目只维护 `fpga-project.toml`，声明项目身份、内置 profile、XPR 或 IP 打包入口、工具版本、板卡和测试台。FPGAFlow 解析显式引用，生成源码与测试 inventory、输入锁和运行记录。XPR 仍是 Vivado GUI 工程真源。兼容入口 `--config` 供旧的完整 profile 使用。
 
 ```sh
-fpga-flow plan --config fpga-flow.toml --target zybo_z7_20
-fpga-flow build --config fpga-flow.toml --stage hardware
-fpga-flow build --config fpga-flow.toml --stage app --with-deps
-fpga-flow validate --config fpga-flow.toml --suite host
+fpga-flow inventory --project fpga-project.toml
+fpga-flow plan --project fpga-project.toml --target zybo_z7_20
+fpga-flow build --project fpga-project.toml --stage hardware
+fpga-flow build --project fpga-project.toml --stage app --with-deps
+fpga-flow validate --project fpga-project.toml --suite host
 ```
 
 Flow 按 argv 执行 profile 命令并记录工具版本、输入哈希、产物哈希、运行日志和阶段结果。stage 的具体构建规则留在工程仓库；硬件工具的 GUI 工程仍由 Vivado 或 Vitis 管理。
 
 ## 主机本地配置
 
-工具安装路径、板卡连接地址和串口属于开发主机配置。将它们写入与 profile 并列的 `fpga-flow.local.toml`，该文件适合加入项目的本地忽略规则：
+工具安装路径、板卡连接地址和串口属于开发主机配置。项目描述模式从仓库外的状态目录读取 `fpga-flow.local.toml`，也可用 `FPGA_FLOW_LOCAL_CONFIG` 指定路径。Linux 默认状态根目录为 `$XDG_STATE_HOME/fpga-flow`，未设置时使用 `~/.local/state/fpga-flow`；Windows 使用 `%LOCALAPPDATA%/FPGAFlow`。各 checkout 按项目 ID 和路径哈希隔离。
 
 ```toml
 [toolchains.vivado]
-command = "/tools/AMDDesignTools/2025.2.1/Vivado/bin/vivado"
+command = ["/tools/AMDDesignTools/2025.2.1/Vivado/bin/vivado"]
 
 [toolchains.vitis]
-command = "/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis"
+command = ["/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis"]
 version_command = ["/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis", "--version"]
 
 [targets.zybo_z7_20]
@@ -59,6 +60,10 @@ port = "/dev/serial/by-id/replace-with-board-adapter"
 
 ## 外部依赖与部署
 
+构建与部署日志、工具工作区和产物写入 `build/fpga-flow/runs/<run-id>/`。外部状态目录保存输入锁和短索引。下游消费通过哈希核验的生产 run 产物；硬件输入变化时使用干净综合与实现，默认关闭增量实现。
+
+可选的 `[exports]` 用 `directory` 和 `artifacts` 指定交付目录与 bundle 产物名。完整 bundle 成功后自动导出到本次生产 run 的独立子目录。未配置时不导出；已有交付目录不会被覆盖。
+
 外部源码依赖使用完整 Git commit 和输入文件模式锁定。阶段执行前后会校验依赖提交与工作树，依赖输入哈希进入阶段指纹。
 
 `side_effects` 用于声明会影响工程或板卡外部状态的阶段。持久存储写入需要显式授权；破坏性部署使用 `--allow-destructive`。部署、验证和构建记录分别保存在每次运行的不可变记录中。
@@ -67,12 +72,12 @@ port = "/dev/serial/by-id/replace-with-board-adapter"
 
 ```sh
 fpga-flow --version
-fpga-flow doctor --config fpga-flow.toml --stage hardware
-fpga-flow resume --config fpga-flow.toml --json
-fpga-flow watch --config fpga-flow.toml --run-id RUN_ID --follow
-fpga-flow history --config fpga-flow.toml --limit 20
-fpga-flow deploy --config fpga-flow.toml --target zybo_z7_20 --stage deploy_jtag --allow-destructive
-fpga-flow release --config fpga-flow.toml --target zybo_z7_20
+fpga-flow doctor --project fpga-project.toml --stage hardware
+fpga-flow resume --project fpga-project.toml --json
+fpga-flow watch --project fpga-project.toml --run-id RUN_ID --follow
+fpga-flow history --project fpga-project.toml --limit 20
+fpga-flow deploy --project fpga-project.toml --target zybo_z7_20 --stage deploy_jtag --allow-destructive
+fpga-flow release --project fpga-project.toml --target zybo_z7_20
 ```
 
 ## 开发与发布

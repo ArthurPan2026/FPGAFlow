@@ -109,7 +109,7 @@ class ZynqJTAGProvider:
             cpu_target_pattern=str(options["cpu_target_pattern"]),
         ), encoding="utf-8", newline="\n")
         command = [*_toolchain_prefix(stage, profile, "xsct"), str(script)]
-        result = run_command(command, cwd=profile.root, env=stage.env,
+        result = run_command(command, cwd=run_dir if profile.project_descriptor is not None else profile.root, env=stage.env,
                              timeout_seconds=min(stage.timeout_seconds or 45, 45),
                              log_dir=run_dir / "jtag-probe")
         if not result.succeeded:
@@ -153,7 +153,7 @@ class ZynqJTAGProvider:
             ps_init_commands=init_commands,
         ), encoding="utf-8", newline="\n")
         command = [*_toolchain_prefix(stage, profile, "xsct"), str(script)]
-        result = run_command(command, cwd=profile.root, env=stage.env,
+        result = run_command(command, cwd=run_dir if profile.project_descriptor is not None else profile.root, env=stage.env,
                              timeout_seconds=stage.timeout_seconds)
         required_markers = ("PL_CONFIGURED", "PS_INITIALIZED", "APP_ELF_DOWNLOADED", "APP_RUNNING")
         missing_markers = [marker for marker in required_markers if marker not in result.stdout]
@@ -176,7 +176,7 @@ class QSPIProgramProvider:
         server_url = str(options.get("server_url", ""))
         prefix = _toolchain_prefix(stage, profile, "program_flash")
         query = [*prefix, "-jtagtargets", "-url", server_url]
-        result = run_command(query, cwd=profile.root, env=stage.env,
+        result = run_command(query, cwd=run_dir if profile.project_descriptor is not None else profile.root, env=stage.env,
                              timeout_seconds=min(stage.timeout_seconds or 90, 90),
                              log_dir=run_dir / "qspi-target-query")
         if not result.succeeded:
@@ -213,7 +213,7 @@ class QSPIProgramProvider:
         prefix = _toolchain_prefix(stage, profile, "program_flash")
         query = [*prefix, "-jtagtargets", "-url", server_url]
         query_dir = run_dir / "target-query"
-        query_result = run_command(query, cwd=profile.root, env=stage.env,
+        query_result = run_command(query, cwd=run_dir if profile.project_descriptor is not None else profile.root, env=stage.env,
                                    timeout_seconds=min(stage.timeout_seconds or 90, 90),
                                    log_dir=query_dir)
         if not query_result.succeeded:
@@ -247,7 +247,7 @@ class QSPIProgramProvider:
             verify=verify, blank_check=blank_check,
         )
         command = [*prefix, *qspi_argv[1:]]
-        program_result = run_command(command, cwd=profile.root, env=stage.env,
+        program_result = run_command(command, cwd=run_dir if profile.project_descriptor is not None else profile.root, env=stage.env,
                                       timeout_seconds=stage.timeout_seconds,
                                       log_dir=run_dir / "program")
         output_text = program_result.stdout + "\n" + program_result.stderr

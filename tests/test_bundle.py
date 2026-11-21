@@ -29,7 +29,7 @@ class BundleTests(unittest.TestCase):
             "[bundle]", 'output_dir = "out/current"', "[bundle.artifacts]",
             'bitstream = "out/build/hardware.bit"', 'fsbl = "out/build/fsbl.elf"',
             'app = "out/build/app.elf"', 'boot_bin = "out/build/boot.bin"',
-            "[toolchains.python]", "command = " + json.dumps(sys.executable),
+            "[toolchains.python]", "command = " + json.dumps([sys.executable]),
             "[targets.board]", 'family = "generic"',
         ]
         for stage, source, output, needs in (

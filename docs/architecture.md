@@ -12,7 +12,7 @@ AMD Ross 文档搜索和 Vivado MCP 用于资料查询和交互调试。FPGAFlow
 
 ## Profile 与阶段调度
 
-Schema version 1 的 profile 声明阶段类型、依赖、输入、产物、工具链、目标和验证规则。新字段保持可选，旧 profile 继续工作。
+消费项目维护 schema version 1 的 `fpga-project.toml`。Flow 的内置 profile 定义阶段图和指纹规则，项目提供输入与测试声明。旧完整 profile 保留兼容入口。XPR、BD 和 IP-XACT 按明确路径解析，缺失或越界引用报错。
 
 阶段指纹包含本阶段输入文件哈希、依赖产物哈希、argv、provider 参数、工具版本和目标身份。缓存命中前，Flow 会重新计算指纹并验证每个输出哈希。失败阶段不会覆盖上一次成功产物的引用；manifest 同时记录最新尝试和最后成功的 run_id。
 
@@ -22,7 +22,7 @@ DAG 默认串行。Profile 可设置 `max_parallel_stages`，并为阶段声明�
 
 ## 运行状态与 Agent 恢复
 
-`manifest.json` 只保存阶段摘要、最近 run_id 和缓存所需的短索引。完整输入哈希、输出哈希、命令、工具版本和证据引用保存在不可变的 `runs/<run_id>/run.json`。旧版 manifest 在首次写入时原样归档，再原子迁移；历史 run 文件不会删除。
+仓库外的 `manifest.json` 保存阶段摘要、最近 run_id 和缓存短索引，`inputs/` 保存阶段输入锁。完整输入哈希、输出哈希、命令、工具版本和证据引用保存在 `build/fpga-flow/runs/<run_id>/run.json`。工具工作区位于该 run 的 `work/`。缓存记录保留实际生产 run 路径；下游执行前核验原产物哈希。旧 manifest 首次写入时原样归档，再迁移索引。
 
 `resume` 汇总活动、失败和待运行阶段，并给出完整 argv 形式的下一步命令。它不启动工具链或操作硬件。失败运行先给出 `watch` 命令查看日志。
 

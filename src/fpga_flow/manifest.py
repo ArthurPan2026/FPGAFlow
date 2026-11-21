@@ -107,7 +107,13 @@ def _stage_summary(record: Mapping[str, Any]) -> dict[str, Any]:
 class ManifestStore:
     """manifest 只索引阶段摘要；完整证据保存在不可变 run.json 中。"""
 
-    def __init__(self, project_root: Path, output_dir: str | Path, project_name: str = "") -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        output_dir: str | Path,
+        project_name: str = "",
+        state_dir: str | Path | None = None,
+    ) -> None:
         try:
             self.project_root = Path(project_root).resolve(strict=True)
         except OSError as exc:
@@ -124,18 +130,40 @@ class ManifestStore:
             raise ManifestError(f"输出目录不能包含 '..'：{output_dir}")
         self._output_relative = output_relative
         self.output_dir = _safe_project_path(self.project_root, output_relative, "Flow 输出目录")
-        self.manifest_path = self.output_dir / "manifest.json"
         self.runs_dir = self.output_dir / "runs"
+        if state_dir is None:
+            self.state_dir = self.output_dir
+        else:
+            state_path = Path(state_dir).expanduser()
+            if not state_path.is_absolute():
+                raise ManifestError("Flow state directory must be absolute")
+            self.state_dir = state_path.resolve(strict=False)
+        self.manifest_path = self.state_dir / "manifest.json"
+        self._legacy_manifest_path = self.output_dir / "manifest.json"
         self.project_name = project_name
         self._mutex = threading.RLock()
 
     @property
     def lock_path(self) -> Path:
-        return self._safe_output_path("run.lock")
+        return self._safe_state_path("run.lock")
 
     def _safe_output_path(self, *parts: str) -> Path:
         relative = self._output_relative.joinpath(*parts)
         return _safe_project_path(self.project_root, relative, "Flow 输出路径")
+
+    def _safe_state_path(self, *parts: str) -> Path:
+        path = self.state_dir.joinpath(*parts)
+        try:
+            resolved = path.resolve(strict=False)
+            resolved.relative_to(self.state_dir)
+        except (OSError, ValueError) as exc:
+            raise ManifestError(f"Flow state path escapes its state directory: {path}") from exc
+        current = self.state_dir
+        for part in Path(*parts).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ManifestError(f"refusing symlink in Flow state path: {current}")
+        return resolved
 
     def empty(self) -> dict[str, Any]:
         return {
@@ -149,7 +177,9 @@ class ManifestStore:
         }
 
     def load(self) -> dict[str, Any]:
-        path = self._safe_output_path("manifest.json")
+        path = self._safe_state_path("manifest.json")
+        if not path.is_file() and self.state_dir != self.output_dir and self._legacy_manifest_path.is_file():
+            path = self._legacy_manifest_path
         if not path.exists():
             return self.empty()
         try:
@@ -164,11 +194,16 @@ class ManifestStore:
         return data
 
     def _archive_legacy_manifest(self) -> None:
-        if not self.manifest_path.is_file():
+        source = self.manifest_path if self.state_dir == self.output_dir else self._legacy_manifest_path
+        if not source.is_file():
             return
-        raw = self.manifest_path.read_bytes()
+        raw = source.read_bytes()
         digest = hashlib.sha256(raw).hexdigest()
-        archive = self._safe_output_path("runs", "migrations", f"manifest-v1-{digest[:16]}.json")
+        archive = (
+            self._safe_output_path("runs", "migrations", f"manifest-v1-{digest[:16]}.json")
+            if self.state_dir == self.output_dir
+            else self._safe_state_path("migrations", f"manifest-{digest[:16]}.json")
+        )
         if not archive.exists():
             _atomic_write(archive, raw, replace=False)
 
@@ -218,10 +253,13 @@ class ManifestStore:
             elif version != SCHEMA_VERSION:
                 raise ManifestError("拒绝保存 schema_version 不受支持的 manifest")
             data["updated_at"] = utc_now()
-            output_dir = self._safe_output_path()
-            output_dir.mkdir(parents=True, exist_ok=True)
-            path = self._safe_output_path("manifest.json")
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            if self.state_dir != self.output_dir and not self.manifest_path.exists():
+                self._archive_legacy_manifest()
+            path = self._safe_state_path("manifest.json")
             _atomic_write(path, _json_bytes(data), replace=True)
+            if self.state_dir != self.output_dir and self._legacy_manifest_path.is_file():
+                self._legacy_manifest_path.unlink()
 
     def run_path(self, run_id: str) -> Path:
         if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:

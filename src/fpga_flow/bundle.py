@@ -11,6 +11,7 @@ import tempfile
 from typing import Any, Mapping
 
 from .fingerprint import FingerprintError, hash_artifact
+from .workspace import logical_path
 
 
 class BundleError(ValueError):
@@ -123,11 +124,12 @@ def refresh_bundle(profile: Any, records: Mapping[str, Mapping[str, Any]]) -> di
         owner = owners[key]
         record = records.get(owner)
         outputs = record.get("outputs") if isinstance(record, Mapping) else None
-        expected = outputs.get(relative) if isinstance(outputs, Mapping) else None
+        concrete = logical_path(record, relative) if isinstance(record, Mapping) else relative
+        expected = outputs.get(concrete) if isinstance(outputs, Mapping) else None
         if not isinstance(expected, str):
             raise BundleError(f"阶段 {owner!r} 没有记录 bundle 产物 {relative!r}")
         try:
-            actual = hash_artifact(profile.root, relative)
+            actual = hash_artifact(profile.root, concrete)
         except (FingerprintError, OSError, ValueError) as exc:
             raise BundleError(f"无法验证 bundle 源产物 {relative!r}：{exc}") from exc
         if actual != expected:
@@ -158,12 +160,13 @@ def refresh_bundle(profile: Any, records: Mapping[str, Mapping[str, Any]]) -> di
     artifacts: dict[str, dict[str, str]] = {}
     for key, (owner, digest) in sorted(resolved.items()):
         relative = bundle.artifacts[key]
+        concrete = logical_path(records[owner], relative)
         filename = _FILENAMES.get(key, Path(relative).name)
         destination = directory / filename
-        _atomic_copy(profile.root / relative, destination, digest)
+        _atomic_copy(profile.root / concrete, destination, digest)
         artifacts[key] = {"path": destination.relative_to(profile.root).as_posix(),
-                          "source": relative, "sha256": digest, "stage": owner,
-                          "run_id": str(records[owner].get("run_id", "")),
+                          "source": concrete, "sha256": digest, "stage": owner,
+                          "run_id": str(records[owner].get("producer_run_id") or records[owner].get("run_id", "")),
                           "fingerprint": str(records[owner].get("fingerprint", ""))}
     toolchains: dict[str, str] = {}
     external: dict[str, dict[str, Any]] = {}
@@ -233,7 +236,10 @@ def resolve_bundle_artifact(profile: Any, stage: Any, relative: str) -> Path:
         raise BundleError(f"无法验证 bundle 产物：{exc}") from exc
     if actual != item.get("sha256"):
         raise BundleError(f"bundle 产物哈希不匹配：{relative}")
-    return profile.root / relative
+    source = item.get("source") if profile.project_descriptor is not None else relative
+    if not isinstance(source, str) or hash_artifact(profile.root, source) != item.get("sha256"):
+        raise BundleError("producing run artifact is missing or changed")
+    return profile.root / source
 
 
 def record_bundle_deployment(profile: Any, bundle_id: str, runner: str,

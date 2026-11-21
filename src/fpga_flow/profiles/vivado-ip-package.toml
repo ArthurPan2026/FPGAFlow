@@ -1,0 +1,54 @@
+schema_version = 1
+
+[project]
+name = "vivado-ip-package"
+description = "Vivado IP producer and release profile"
+
+[flow]
+output_dir = "build/fpga-flow"
+max_parallel_stages = 1
+
+[toolchains.python]
+command = ["python3"]
+version_args = ["--version"]
+
+[toolchains.vivado]
+command = ["vivado"]
+version_args = ["-version"]
+expected_version = "vivado v{vivado_version}"
+
+[stages.sim]
+outputs = ["build/fpga-flow/tests/**/run.log", "build/fpga-flow/tests/video-tests.log"]
+kind = "test"
+inputs = ["@project.tests:default"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 14400
+description = "Run the declared IP RTL regression suite"
+
+[stages.package]
+outputs = ["build/fpga-flow/packages/ip_repo", "build/fpga-flow/ip_catalog_validation_feature_profile"]
+kind = "build"
+inputs = ["@project.package"]
+command = ["python3", "--version"]
+toolchains = ["python", "vivado"]
+timeout_seconds = 14400
+description = "Package the composite IP and validate it in a Vivado IP catalog"
+
+[stages.release]
+outputs = ["build/fpga-flow/artifacts/releases/EmbeddedVideoIP-{package_version}-vivado-2025.2.1.zip", "build/fpga-flow/artifacts/releases/EmbeddedVideoIP-PS-Zynq7000-{package_version}.zip", "build/fpga-flow/artifacts/releases/SHA256SUMS"]
+kind = "build"
+needs = ["sim", "package"]
+inputs = []
+command = ["python3", "--version"]
+toolchains = ["python"]
+timeout_seconds = 1800
+description = "Create consumer-sized versioned IP and Zynq PS release archives"
+
+[bundle]
+schema_version = 3
+output_dir = "build/fpga-flow/current"
+
+[bundle.artifacts]
+vivado_ip = "build/fpga-flow/artifacts/releases/EmbeddedVideoIP-{package_version}-vivado-2025.2.1.zip"
+zynq7000_ps = "build/fpga-flow/artifacts/releases/EmbeddedVideoIP-PS-Zynq7000-{package_version}.zip"

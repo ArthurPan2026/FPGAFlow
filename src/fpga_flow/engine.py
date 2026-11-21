@@ -33,8 +33,11 @@ from .fingerprint import (
 from .manifest import ManifestError, ManifestStore, SCHEMA_VERSION, utc_now
 from .locking import ProjectRunLock, RunLockError
 from .models import FlowConfig, StageConfig
+from .project import inventory_data, inventory_toml, project_context
 from .runner import CommandResult, run_command
 from .toolchains import ToolchainResult, probe_toolchain
+from .workspace import output_paths, run_workspace
+from .export import export_bundle
 
 
 class FlowError(RuntimeError):
@@ -151,6 +154,8 @@ def _stage_contract(profile: FlowConfig, stage: StageConfig, target: str | None)
                    "environment_variable": profile.external_dependencies[name].environment_variable}
             for name in stage.external_inputs
         }
+    if profile.project_descriptor is not None:
+        contract["project_context"] = project_context(profile.project_descriptor, stage.name)
     return contract
 
 
@@ -182,6 +187,13 @@ def _format_argv(argv: Sequence[str], fields: Mapping[str, str]) -> tuple[str, .
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_text_atomic(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(value, encoding="utf-8", newline="\n")
+    os.replace(temporary, path)
 
 
 def _write_failure_logs(run_dir: Path, command: Sequence[str], message: str, started: str) -> None:
@@ -245,7 +257,7 @@ def _outputs_match(record: Mapping[str, Any], fingerprint: str, patterns: Sequen
     if not isinstance(expected, Mapping):
         return False
     try:
-        concrete, per_pattern = _expand_output_patterns(root, patterns)
+        concrete, per_pattern = _expand_output_patterns(root, output_paths(record, patterns))
         if any(not matches for matches in per_pattern.values()):
             return False
         if set(concrete) != {str(name) for name in expected}:
@@ -260,7 +272,8 @@ def _evidence_hashes(root: Path, run_dir: Path) -> dict[str, str]:
     """对运行中的所有证据文件计算哈希，但不包含不可变 run.json 本身。"""
     relative = run_dir.resolve(strict=True).relative_to(root.resolve(strict=True)).as_posix()
     files = expand_inputs(root, [f"{relative}/**"], require_matches=False)
-    selected = [path.relative_to(root.resolve()).as_posix() for path in files if path.name != "run.json"]
+    selected = [path.relative_to(root.resolve()).as_posix() for path in files
+                if path.name != "run.json" and "work" not in path.relative_to(run_dir).parts]
     return hash_artifacts(root, selected) if selected else {}
 
 
@@ -334,7 +347,12 @@ class FlowEngine:
     def __init__(self, profile: FlowConfig, *, providers: Mapping[str, StageProvider] | None = None,
                  progress_callback: Callable[[Mapping[str, Any]], None] | None = None):
         self.profile = profile
-        self.store = ManifestStore(profile.root, profile.output_dir, profile.project_name)
+        self.store = ManifestStore(
+            profile.root,
+            profile.output_dir,
+            profile.project_name,
+            state_dir=profile.state_dir,
+        )
         self.providers = dict(_PROVIDER_REGISTRY)
         if providers:
             self.providers.update(providers)
@@ -343,6 +361,7 @@ class FlowEngine:
         self._wait_lock_current = False
         self._completed_in_session: set[str] = set()
         self._session_lock = threading.RLock()
+        self._session_tool_probes: dict[str, tuple[ToolchainResult, str]] = {}
 
     @classmethod
     def from_file(cls, config_path: str | Path = "fpga-flow.toml", *,
@@ -350,6 +369,48 @@ class FlowEngine:
                   progress_callback: Callable[[Mapping[str, Any]], None] | None = None) -> "FlowEngine":
         from .config import load_profile
         return cls(load_profile(config_path), providers=providers, progress_callback=progress_callback)
+
+    def _write_project_inventory(
+        self,
+        *,
+        current_stage: str | None = None,
+        current_status: str | None = None,
+        current_run_id: str | None = None,
+        run_dir: Path | None = None,
+    ) -> Path:
+        descriptor = self.profile.project_descriptor
+        if descriptor is None:
+            raise FlowError("FLOW-PROJECT-DESCRIPTOR", "project inventory requires fpga-project.toml")
+        manifest = self.store.load()
+        stages = manifest.get("stages", {})
+        if not isinstance(stages, Mapping):
+            stages = {}
+        contents = inventory_toml(inventory_data(
+            descriptor,
+            stages,
+            current_stage=current_stage,
+            current_status=current_status,
+            current_run_id=current_run_id,
+        ))
+        destination = self.profile.output_dir / "project-inventory.toml"
+        _write_text_atomic(destination, contents)
+        if run_dir is not None:
+            _write_text_atomic(run_dir / "project-inventory.toml", contents)
+        return destination
+
+    def write_project_inventory(self, *, wait_lock: bool = False) -> dict[str, Any]:
+        with self._mutation_guard("inventory", wait_lock=wait_lock):
+            path = self._write_project_inventory()
+        descriptor = self.profile.project_descriptor
+        assert descriptor is not None
+        data = inventory_data(descriptor, self.store.load().get("stages", {}))
+        return {
+            "status": "succeeded",
+            "project": self.profile.project_name,
+            "path": str(path),
+            "source_count": len(data["sources"]),
+            "test_count": len(data["tests"]),
+        }
 
     def _notify(self, event: Mapping[str, Any]) -> None:
         if self.progress_callback is None:
@@ -371,6 +432,7 @@ class FlowEngine:
         self._wait_lock_current = wait_lock
         with self._session_lock:
             self._completed_in_session.clear()
+            self._session_tool_probes.clear()
         try:
             yield lock
         finally:
@@ -463,9 +525,27 @@ class FlowEngine:
         for name in stage.toolchains:
             config = self.profile.toolchains[name]
             command, version_args = self._toolchain_command(name)
-            probe = probe_toolchain(name, command, version_args, config.expected_version,
-                                    cwd=self.profile.root, log_dir=run_dir / "toolchains" / name,
-                                    failure_markers=config.failure_markers)
+            resolved = shutil.which(command) or command
+            executable = Path(resolved).resolve(strict=False)
+            stat = executable.stat() if executable.is_file() else None
+            identity = sha256_json({"name": name, "path": str(executable),
+                "stat": [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns] if stat else None,
+                "args": version_args, "expected": config.expected_version,
+                "failure_markers": config.failure_markers})
+            # Reuse a probe only within this guarded CLI operation. Each new
+            # invocation probes afresh; changed executables invalidate reuse.
+            with self._session_lock:
+                cached = self._session_tool_probes.get(identity)
+                if cached is None:
+                    probe = probe_toolchain(name, command, version_args, config.expected_version,
+                        cwd=run_dir if self.profile.project_descriptor else self.profile.root,
+                        log_dir=run_dir / "toolchains" / name, failure_markers=config.failure_markers)
+                    if probe.ok:
+                        self._session_tool_probes[identity] = (probe, run_dir.name)
+                else:
+                    probe, producer_run = cached
+                    _write_json(run_dir / "toolchains" / name / "probe-reference.json",
+                        {"run_id": producer_run, "identity": identity, "scope": "current-operation"})
             detail = {"name": probe.name, "configured_command": probe.configured_command,
                       "resolved_command": probe.resolved_command, "expected_version": probe.expected_version,
                       "reported_version": probe.reported_version, "status": probe.status,
@@ -493,7 +573,8 @@ class FlowEngine:
             command, version_args = self._toolchain_command(name)
             probe = probe_toolchain(
                 name, command, version_args, config.expected_version,
-                cwd=self.profile.root, log_dir=run_dir / "toolchains" / name,
+                cwd=run_dir if self.profile.project_descriptor else self.profile.root,
+                log_dir=run_dir / "toolchains" / name,
                 failure_markers=config.failure_markers,
             )
             details[name] = {
@@ -653,7 +734,9 @@ class FlowEngine:
                   dependencies: Mapping[str, Any], versions: Mapping[str, str]) -> tuple[CommandResult, tuple[str, ...]]:
         runner = _runner_name(stage)
         if runner == "command":
-            fields = {"root": str(self.profile.root), "out_dir": str(self.profile.output_dir),
+            workspace = run_workspace(self.profile, run_dir)
+            workspace.mkdir(parents=True, exist_ok=True)
+            fields = {"root": str(self.profile.root), "out_dir": str(workspace),
                       "run_dir": str(run_dir), "target": target or ""}
             command = _format_argv(stage.command, fields)
             try:
@@ -675,9 +758,46 @@ class FlowEngine:
             # exactly the dependency and toolchain records verified by Flow.
             env["FPGA_FLOW_DEPENDENCIES_JSON"] = json.dumps(dependencies, sort_keys=True)
             env["FPGA_FLOW_TOOL_VERSIONS_JSON"] = json.dumps(versions, sort_keys=True)
+            env["FPGA_FLOW_RUN_DIR"] = str(run_dir.resolve())
+            env["FPGA_FLOW_OUTPUT_DIR"] = str(workspace.resolve())
+            env["FPGA_FLOW_PROJECT_OUTPUT_DIR"] = str(self.profile.output_dir.resolve())
+            env["FPGA_FLOW_PROJECT_FILE"] = str(self.profile.config_path)
+            for tool_name, variable in (("vivado", "VIVADO_BIN"), ("vitis", "VITIS_BIN")):
+                tool = self.profile.toolchains.get(tool_name)
+                if tool and len(tool.command) == 1:
+                    env[variable] = shutil.which(tool.command[0]) or tool.command[0]
+            command = list(command)
+            if self.profile.project_descriptor is not None:
+                for tool_name in stage.toolchains:
+                    tool = self.profile.toolchains[tool_name]
+                    aliases = {tool_name, "python3", "python3.15"} if tool_name == "python" else {tool_name}
+                    if command and command[0] in aliases:
+                        command = [*tool.command, *command[1:]]
+                    if tool_name == "vivado" and "--vivado" in command:
+                        command[command.index("--vivado") + 1] = tool.command[0]
+            env["FPGA_FLOW_STATE_DIR"] = str(self.store.state_dir.resolve())
+            env["FPGA_FLOW_MANIFEST_PATH"] = str(self.store.manifest_path.resolve())
+            env["FPGA_FLOW_TARGET"] = target or ""
+            target_profile = self.profile.targets.get(target or "", {})
+            if isinstance(target_profile, Mapping):
+                uart_profile = target_profile.get("uart", {})
+                if isinstance(uart_profile, Mapping):
+                    uart_port = uart_profile.get("port") or uart_profile.get("device")
+                    if isinstance(uart_port, str) and uart_port:
+                        env["FPGA_FLOW_UART_PORT"] = uart_port
+                hw_server_url = target_profile.get("hw_server_url")
+                if isinstance(hw_server_url, str) and hw_server_url:
+                    env["FPGA_FLOW_HW_SERVER_URL"] = hw_server_url
             def progress(stats: Mapping[str, object]) -> None:
                 self._notify({"event": "stage_progress", "stage": stage.name,
                               "run_id": run_dir.name, **dict(stats)})
+            if self.profile.project_descriptor is not None:
+                # Profile scripts are explicit inputs; resolve them before
+                # changing cwd so vendor tools cannot write in the source root.
+                command = tuple(str(self.profile.root / arg)
+                    if (self.profile.root / arg).is_file() and not Path(arg).is_absolute()
+                    else arg for arg in command)
+                cwd = workspace
             result = run_command(command, cwd=cwd, env=env,
                                  timeout_seconds=stage.timeout_seconds, log_dir=run_dir,
                                  on_progress=progress)
@@ -721,11 +841,41 @@ class FlowEngine:
             "log_files": {"stdout": "stdout.log", "stderr": "stderr.log",
                           "command": "command.json", "execution": "execution.json"},
         }
+        if self.profile.project_descriptor is not None:
+            record["logical_output_root"] = self.profile.output_dir.relative_to(self.profile.root).as_posix()
+            record["output_root"] = run_workspace(self.profile, run_dir).relative_to(self.profile.root).as_posix()
+            if cache_hit:
+                # Cached outputs retain the workspace of the producing run.
+                previous = self.store.successful_stage_record(self.store.load(), stage.name) or {}
+                record["output_root"] = previous.get("output_root", record["output_root"])
+                record["producer_run_id"] = previous.get("producer_run_id", previous.get("run_id"))
         if elapsed_seconds is not None:
             record["elapsed_seconds"] = elapsed_seconds
         if error is not None:
             record["error_code"] = error.code
             record["error"] = str(error)
+        if self.profile.project_descriptor is not None:
+            try:
+                current_manifest = self.store.load()
+                stage_records = current_manifest.get("stages", {})
+                if not isinstance(stage_records, Mapping):
+                    stage_records = {}
+                inventory = inventory_toml(inventory_data(
+                    self.profile.project_descriptor,
+                    stage_records,
+                    current_stage=stage.name,
+                    current_status=status,
+                    current_run_id=run_id,
+                ))
+                _write_text_atomic(run_dir / "project-inventory.toml", inventory)
+                _write_text_atomic(self.profile.output_dir / "project-inventory.toml", inventory)
+            except (OSError, ValueError) as exc:
+                if status == "succeeded":
+                    raise FlowError(
+                        "FLOW-PROJECT-INVENTORY",
+                        f"无法生成项目源码和测试清单：{exc}",
+                    ) from exc
+                record["project_inventory_error"] = str(exc)
         try:
             record["evidence"] = _evidence_hashes(self.profile.root, run_dir)
         except (FingerprintError, ManifestError, OSError, ValueError) as exc:
@@ -791,6 +941,12 @@ class FlowEngine:
                 _stage_contract(self.profile, stage, selected_target),
                 inputs, dependencies, versions,
             )
+            if self.profile.project_descriptor is not None:
+                _write_json(self.store.state_dir / "inputs" / f"{run_id}.json", {
+                    "stage": stage.name, "fingerprint": fingerprint,
+                    "inputs": inputs, "dependencies": dependencies,
+                    "tools": versions, "contract": _stage_contract(self.profile, stage, selected_target),
+                })
             cacheable = stage.kind in {"build", "test"} and not force
             if cacheable and isinstance(previous_stage_record, Mapping) and _outputs_match(
                 previous_stage_record, fingerprint, stage.outputs, self.profile.root
@@ -844,7 +1000,11 @@ class FlowEngine:
             if post_dependencies is None or post_dependencies != dependencies:
                 raise FlowError("FLOW-DEPENDENCY-CHANGED", dependency_error or "阶段运行期间依赖发生变化")
             try:
-                concrete_outputs, _ = _expand_output_patterns(self.profile.root, stage.outputs)
+                output_record = {
+                    "logical_output_root": self.profile.output_dir.relative_to(self.profile.root).as_posix(),
+                    "output_root": run_workspace(self.profile, run_dir).relative_to(self.profile.root).as_posix(),
+                } if self.profile.project_descriptor is not None else {}
+                concrete_outputs, _ = _expand_output_patterns(self.profile.root, output_paths(output_record, stage.outputs))
                 outputs = hash_artifacts(self.profile.root, concrete_outputs)
             except (FlowError, FingerprintError, OSError, ValueError) as exc:
                 raise FlowError("FLOW-OUTPUT-INVALID", str(exc)) from exc
@@ -893,7 +1053,9 @@ class FlowEngine:
                         raise FlowError("FLOW-BUNDLE-STALE", f"bundle 阶段 {name!r} 无效：{reason}")
                     return None
                 records[name] = record
-            return refresh_bundle(self.profile, records)
+            bundle = refresh_bundle(self.profile, records)
+            export_bundle(self.profile, bundle)
+            return bundle
         except FlowError:
             raise
         except (BundleError, FingerprintError, ManifestError, OSError, ValueError) as exc:
@@ -930,6 +1092,8 @@ class FlowEngine:
                 continue
             run_id = str(record.get("run_id", ""))
             relative = stage.options.get("bundle_evidence")
+            if isinstance(relative, str):
+                relative = output_paths(record, (relative,))[0]
             outputs = record.get("outputs")
             try:
                 if not isinstance(relative, str) or not isinstance(outputs, Mapping) or relative not in outputs:
@@ -1280,7 +1444,8 @@ class FlowEngine:
         return subprocess.list2cmdline(list(argv)) if os.name == "nt" else shlex.join(list(argv))
 
     def _cli_argv(self, action: str, *arguments: str) -> list[str]:
-        return ["fpga-flow", "--config", self._config_argument(), action, *arguments]
+        option = "--project" if self.profile.project_descriptor is not None else "--config"
+        return ["fpga-flow", option, self._config_argument(), action, *arguments]
 
     def _stage_action(self, stage: StageConfig, *, target: str | None,
                       suite: str | None = None, with_deps: bool = False) -> list[str] | None:
