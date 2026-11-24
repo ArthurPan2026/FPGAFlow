@@ -158,6 +158,9 @@ class UARTCommandProvider:
         line_ending = str(options.get("line_ending", "\r\n"))
         prompt_regex = str(options.get("prompt_regex", selector.get("prompt_regex", r"[>#]\s*$")))
         idle_seconds = float(options.get("idle_seconds", 0.15))
+        require_command_echo = options.get("require_command_echo", False)
+        if not isinstance(require_command_echo, bool):
+            raise UARTProviderError("require_command_echo 必须是布尔值")
         steps = options.get("steps")
         if not isinstance(steps, (list, tuple)) or not steps:
             raise UARTProviderError("UART 提供器需要非空的 options.steps 数组")
@@ -178,6 +181,9 @@ class UARTCommandProvider:
                 )
             step_prompt = str(raw_step.get("prompt_regex", prompt_regex))
             _compile_patterns((step_prompt,) if step_prompt else (), f"steps[{index}].prompt_regex")
+            step_require_echo = raw_step.get("require_command_echo", require_command_echo)
+            if not isinstance(step_require_echo, bool):
+                raise UARTProviderError(f"steps[{index}].require_command_echo 必须是布尔值")
 
         started = _now()
         monotonic_start = time.monotonic()
@@ -241,6 +247,10 @@ class UARTCommandProvider:
                     last_data = time.monotonic()
                     step_prompt = str(raw_step.get("prompt_regex", prompt_regex))
                     require_prompt = bool(raw_step.get("require_prompt", bool(step_prompt)))
+                    step_require_echo = raw_step.get("require_command_echo", require_command_echo)
+                    echo_pattern = re.compile(rf"(?:^|\r?\n|\\r\\n|>[ \t]*){re.escape(command)}\r?\n") \
+                        if step_require_echo else None
+                    echo_end = None
                     prompt_seen = False
                     while time.monotonic() < deadline:
                         waiting = int(getattr(stream, "in_waiting", 0))
@@ -248,13 +258,20 @@ class UARTCommandProvider:
                         if chunk:
                             response.extend(chunk)
                             last_data = time.monotonic()
-                            if step_prompt and _regex_match(step_prompt, response.decode("utf-8", errors="replace"),
-                                                           "prompt"):
+                            response_text = response.decode("utf-8", errors="replace")
+                            if echo_pattern is not None and echo_end is None:
+                                echo_match = echo_pattern.search(response_text)
+                                if echo_match is not None:
+                                    echo_end = echo_match.end()
+                            echo_seen = echo_pattern is None or echo_end is not None
+                            if step_prompt and echo_seen and _regex_match(step_prompt, response_text, "prompt"):
                                 prompt_seen = True
                                 break
                         elif response and not require_prompt and time.monotonic() - last_data >= idle_seconds:
-                            break
+                            if echo_pattern is None or echo_end is not None:
+                                break
                     response_text = response.decode("utf-8", errors="replace")
+                    assertion_text = response_text[echo_end:] if echo_end is not None else response_text
                     transcript.append(response_text)
                     out_log.write(response_text)
                     if response_text and not response_text.endswith("\n"):
@@ -262,7 +279,8 @@ class UARTCommandProvider:
                     out_log.flush()
                     transport_failed = require_prompt and not prompt_seen
                     if transport_failed:
-                        error = f"步骤 {index + 1} 命令 {command!r} 在超时前未收到提示符"
+                        detail = "命令回显和提示符" if step_require_echo and echo_end is None else "提示符"
+                        error = f"步骤 {index + 1} 命令 {command!r} 在超时前未收到{detail}"
                         errors.append(error)
                         err_log.write(error + "\n")
                         err_log.flush()
@@ -274,19 +292,19 @@ class UARTCommandProvider:
                         )
                     assertion_errors.extend(
                         f"命令 {command!r} 的响应缺少预期正则 {pattern!r}"
-                        for pattern in expected if not _regex_match(pattern, response_text, f"steps[{index}].expect")
+                        for pattern in expected if not _regex_match(pattern, assertion_text, f"steps[{index}].expect")
                     )
                     assertion_errors.extend(
                         f"命令 {command!r} 的响应不包含预期文本 {text!r}"
-                        for text in expected_text if text not in response_text
+                        for text in expected_text if text not in assertion_text
                     )
                     assertion_errors.extend(
                         f"命令 {command!r} 的响应匹配拒绝正则 {pattern!r}"
-                        for pattern in rejected if _regex_match(pattern, response_text, f"steps[{index}].reject")
+                        for pattern in rejected if _regex_match(pattern, assertion_text, f"steps[{index}].reject")
                     )
                     assertion_errors.extend(
                         f"命令 {command!r} 的响应包含拒绝文本 {text!r}"
-                        for text in rejected_text if text in response_text
+                        for text in rejected_text if text in assertion_text
                     )
                     errors.extend(assertion_errors)
                     if assertion_errors:

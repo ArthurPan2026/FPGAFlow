@@ -71,6 +71,19 @@ class DelayedFakePort(FakePort):
         return super().read(size)
 
 
+class StalePromptFakePort(DelayedFakePort):
+    @property
+    def in_waiting(self):
+        if self.buffer:
+            return len(self.buffer)
+        return super().in_waiting
+
+    def read(self, size=1):
+        if self.buffer:
+            return FakePort.read(self, size)
+        return super().read(size)
+
+
 class FakePortInfo:
     device = "COM5"
     serial_number = "FTDI-123"
@@ -136,6 +149,29 @@ class UARTProviderTests(unittest.TestCase):
             result = UARTCommandProvider(serial_factory=lambda **kwargs: fake).execute(stage, profile, root / "run", "board_a")
             self.assertTrue(result.succeeded, result.stderr)
             self.assertIn("late response OK", result.stdout)
+
+    def test_stale_prompt_is_ignored_until_the_current_command_echo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = StalePromptFakePort(
+                {"status": b"[INPUT] detached gen=6\\r\\nstatus\r\n[STAT] frame=2\r\n> "},
+                delay_seconds=0.05,
+            )
+            fake.buffer.extend(b"> \r\n")
+            options = {
+                "steps": [{"send": "status", "expect_text": ["[STAT] frame=2"]}],
+                "timeout_seconds": 0.5,
+                "prompt_regex": r">\s*$",
+                "require_command_echo": True,
+                "reset_input_buffer": False,
+            }
+            profile, stage = self._profile(root, options, {"port": "COM5"})
+            result = UARTCommandProvider(serial_factory=lambda **kwargs: fake).execute(
+                stage, profile, root / "run", "board_a"
+            )
+            self.assertTrue(result.succeeded, result.stderr)
+            self.assertEqual(fake.commands, ["status"])
+            self.assertIn("[STAT] frame=2", result.stdout)
 
     def test_usb_selector_requires_one_exact_match_and_reports_collision(self):
         with __import__("tempfile").TemporaryDirectory() as tmp:

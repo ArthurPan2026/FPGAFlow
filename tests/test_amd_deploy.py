@@ -13,9 +13,18 @@ from fpga_flow.amd_deploy import (
     render_zynq_jtag_probe_tcl,
     select_unique_flash_target,
 )
+from fpga_flow.providers.amd import _qspi_server_url
 
 
 class AmdDeployHelpersTests(unittest.TestCase):
+    def test_qspi_uses_the_shared_hw_server_url_when_no_specific_url_is_set(self) -> None:
+        self.assertEqual(_qspi_server_url({"hw_server_url": "tcp:127.0.0.1:3121"}),
+                         "tcp:127.0.0.1:3121")
+        self.assertEqual(_qspi_server_url({"server_url": "tcp:other:3121",
+                                           "hw_server_url": "tcp:127.0.0.1:3121"}),
+                         "tcp:other:3121")
+        self.assertEqual(_qspi_server_url({"hw_server_url": "  "}), "")
+
     def test_program_flash_targets_parse_and_profile_selects_exactly_one(self) -> None:
         targets = parse_program_flash_targets(
             "2 jsn-Board A-4ba00477-0 (name arm_dap idcode 4ba00477)\n"

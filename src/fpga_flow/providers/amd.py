@@ -41,6 +41,11 @@ def _target_options(stage: StageConfig, profile: FlowConfig, target: str | None)
     return values
 
 
+def _qspi_server_url(options: Mapping[str, Any]) -> str:
+    value = options.get("server_url") or options.get("hw_server_url")
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _relative_artifact(value: Any, stage: StageConfig, profile: FlowConfig) -> tuple[Path, str]:
     if not isinstance(value, str) or not value.strip():
         raise AMDProviderError("产物选项必须是非空的项目相对路径或 glob 模式")
@@ -173,7 +178,7 @@ class QSPIProgramProvider:
         options = _target_options(stage, profile, target)
         if "target_device_name" not in options:
             raise AMDProviderError("QSPI profile 缺少 target_device_name")
-        server_url = str(options.get("server_url", ""))
+        server_url = _qspi_server_url(options)
         prefix = _toolchain_prefix(stage, profile, "program_flash")
         query = [*prefix, "-jtagtargets", "-url", server_url]
         result = run_command(query, cwd=run_dir if profile.project_descriptor is not None else profile.root, env=stage.env,
@@ -200,7 +205,7 @@ class QSPIProgramProvider:
         missing = [name for name in required if name not in options]
         if missing:
             raise AMDProviderError(f"QSPI profile 缺少选项：{', '.join(missing)}")
-        server_url = str(options.get("server_url", ""))
+        server_url = _qspi_server_url(options)
         boot_image, image_rel = _relative_artifact(options["boot_image"], stage, profile)
         fsbl, fsbl_rel = _relative_artifact(options["fsbl"], stage, profile)
         try:

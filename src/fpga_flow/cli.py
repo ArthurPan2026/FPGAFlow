@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", default=None, help="兼容模式的完整 Flow profile 文件")
     parser.add_argument("--project", default=None, help="声明式 FPGA 项目清单")
+    parser.add_argument("--workspace", default=None, help="跨项目 fpga-workspace.toml 清单")
     parser.add_argument("--json", dest="json_output", action="store_true", help="输出机器可读 JSON")
     parser.add_argument("--details", action="store_true",
                         help="完整展开输入、输出和证据哈希；默认只返回数量")
@@ -43,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub._optionals.title = "选项"
         sub.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         sub.add_argument("--project", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        sub.add_argument("--workspace", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
         sub.add_argument("--json", dest="json_output", action="store_true", default=argparse.SUPPRESS,
                          help="输出机器可读 JSON")
         sub.add_argument("--details", action="store_true", default=argparse.SUPPRESS,
@@ -123,6 +125,17 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--limit", type=int, default=20, help="返回记录数，范围为 1 到 500")
     history.add_argument("--before", help="从此 run_id 之前继续查询")
     history.add_argument("--stage", help="筛选阶段名称")
+
+    workspace_run = subparsers.add_parser("run", help="执行跨项目 workspace DAG")
+    common(workspace_run)
+    mutating(workspace_run)
+    workspace_run.add_argument("--force", action="store_true", help="强制运行 workspace 所选阶段")
+    workspace_run.add_argument("--include-optional", action="store_true",
+                               help="运行标记为 optional 的 host/RTL 回归节点")
+    workspace_run.add_argument("--allow-side-effects", action="store_true",
+                               help="确认运行 workspace 中声明的板卡或运行时副作用")
+    workspace_run.add_argument("--allow-destructive", action="store_true",
+                               help="确认运行 workspace 中声明的破坏性操作")
 
     return parser
 
@@ -251,12 +264,40 @@ def _compact_json_result(value: Any) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    workspace_path = getattr(args, "workspace", None)
+    as_json = bool(getattr(args, "json_output", False))
+    if workspace_path:
+        if args.config or args.project:
+            parser.error("--workspace 不能与 --config 或 --project 同时使用")
+        if args.action not in {"plan", "status", "history", "run"}:
+            parser.error("--workspace 只支持 plan/status/history/run")
+        try:
+            from .workspace_dag import WorkspaceDAG
+            workspace = WorkspaceDAG.from_file(workspace_path)
+            if args.action == "plan":
+                result = workspace.plan()
+            elif args.action == "status":
+                result = workspace.status()
+            elif args.action == "history":
+                result = workspace.history(limit=args.limit)
+            else:
+                result = workspace.run(force=args.force, include_optional=args.include_optional,
+                                      allow_side_effects=args.allow_side_effects,
+                                      allow_destructive=args.allow_destructive, wait_lock=args.wait_lock)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+            return 1 if result.get("status") == "failed" else 0
+        except (OSError, ValueError) as exc:
+            failure = {"status": "failed", "error_code": getattr(exc, "code", type(exc).__name__),
+                       "error": str(exc)}
+            print(json.dumps(failure, ensure_ascii=False, sort_keys=True))
+            return 1
+    if args.action == "run":
+        parser.error("run 需要 --workspace <fpga-workspace.toml>")
     if args.config and args.project:
         parser.error("--config 和 --project 不能同时指定")
     config_path = args.project or args.config
     if config_path is None:
         config_path = "fpga-project.toml" if Path("fpga-project.toml").is_file() else "fpga-flow.toml"
-    as_json = bool(getattr(args, "json_output", False))
     # Progress is written to stderr, so JSON stdout remains parseable while long runs stay visible.
     progress = _progress
     try:

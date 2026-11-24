@@ -46,7 +46,7 @@ expected_version = "xsct {vitis_version}"
 
 [toolchains.program_flash]
 command = ["program_flash"]
-version_command = ["vitis", "-version"]
+version_command = ["vitis", "--version"]
 expected_version = "Vitis v{vitis_version}"
 
 [targets.board]
