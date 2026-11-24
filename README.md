@@ -1,90 +1,67 @@
 # FPGAFlow
 
-FPGAFlow 是可独立安装、与具体 FPGA 工程解耦的 Python CLI，用于执行工程 profile 中声明的构建、验证和部署阶段。项目仓库维护自己的 Vivado/Vitis 输入、脚本、配置和产物；FPGAFlow 作为外部工具安装在开发主机。
+FPGAFlow 是面向 AMD Vivado/Vitis 工程的 Python 构建工具。它依据项目清单执行构建、验证和部署，使用内容指纹复用产物，并保存每次运行的输入、命令、工具版本和结果。当前版本为 `0.3.0`，运行环境为 Python 3.15 或更新版本。
 
-## 安装与版本
+## 架构总览
 
-当前版本为 0.2.0，Python 要求为 3.15 或更新版本。构建 wheel 与 source distribution 的发布流程由版本标签触发，产物发布在 GitHub Releases。
+![FPGAFlow 架构总览](docs/figures/flow-overview.svg)
 
-下载适用于目标版本的 wheel 后安装：
+图 1　项目清单描述工程，执行引擎调度阶段，provider 连接工具和设备。运行记录将源码、产物与验证结果关联。详细设计与跨项目流程见[架构说明](docs/architecture.md)。
+
+## 安装与开始使用
 
 ```sh
-python -m venv .venv
+git clone https://github.com/ArthurPan2026/FPGAFlow.git
+cd FPGAFlow
+python3.15 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./fpga_flow-0.2.0-py3-none-any.whl
+python -m pip install '.[uart]'
 fpga-flow --version
 ```
 
-Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。使用 UART provider 时安装 pySerial：
+Windows PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活环境。Vivado、Vitis、Bootgen 与板卡驱动按消费项目要求安装。已发布的 wheel 和源码包见 [GitHub Releases](https://github.com/ArthurPan2026/FPGAFlow/releases)。
+
+在 FPGA 工程根目录运行以下命令。
 
 ```sh
-python -m pip install "pyserial>=3.5"
+fpga-flow --project fpga-project.toml inventory
+fpga-flow --project fpga-project.toml plan
+fpga-flow --project fpga-project.toml build --stage boot --with-deps
+fpga-flow --project fpga-project.toml validate --suite host
+fpga-flow --project fpga-project.toml history --limit 10
 ```
 
-Vivado、Vitis、XSCT、Bootgen 和板卡驱动独立安装，并按工程要求锁定版本。
+## 工程清单与跨项目构建
 
-## 工程 profile
+`fpga-project.toml` 声明工程入口、工具版本、目标板、输入、测试和产物。Vivado XPR、Block Design、RTL、PS 源码和板级规则由消费项目管理。内置 profile 提供通用阶段，`--config` 接受完整 profile。
 
-消费项目只维护 `fpga-project.toml`，声明项目身份、内置 profile、XPR 或 IP 打包入口、工具版本、板卡和测试台。FPGAFlow 解析显式引用，生成源码与测试 inventory、输入锁和运行记录。XPR 仍是 Vivado GUI 工程真源。兼容入口 `--config` 供旧的完整 profile 使用。
+`fpga-workspace.toml` 把多个项目连接成 DAG，适用于共享 IP 发布、校验导入、消费工程构建和部署。
 
 ```sh
-fpga-flow inventory --project fpga-project.toml
-fpga-flow plan --project fpga-project.toml --target zybo_z7_20
-fpga-flow build --project fpga-project.toml --stage hardware
-fpga-flow build --project fpga-project.toml --stage app --with-deps
-fpga-flow validate --project fpga-project.toml --suite host
+fpga-flow --workspace fpga-workspace.toml plan --json
+fpga-flow --workspace fpga-workspace.toml run --allow-side-effects --allow-destructive
+fpga-flow --workspace fpga-workspace.toml run --include-optional --allow-side-effects --allow-destructive
 ```
 
-Flow 按 argv 执行 profile 命令并记录工具版本、输入哈希、产物哈希、运行日志和阶段结果。stage 的具体构建规则留在工程仓库；硬件工具的 GUI 工程仍由 Vivado 或 Vitis 管理。
+标记 `optional = true` 的回归默认跳过，`--include-optional` 将其纳入执行。导入节点核验发布包 SHA-256、VLNV、版本和来源，保存导入前后文件树哈希。具体格式见 [workspace 使用说明](docs/workspaces.md)。
 
-## 主机本地配置
+## 主机配置与执行记录
 
-工具安装路径、板卡连接地址和串口属于开发主机配置。项目描述模式从仓库外的状态目录读取 `fpga-flow.local.toml`，也可用 `FPGA_FLOW_LOCAL_CONFIG` 指定路径。Linux 默认状态根目录为 `$XDG_STATE_HOME/fpga-flow`，未设置时使用 `~/.local/state/fpga-flow`；Windows 使用 `%LOCALAPPDATA%/FPGAFlow`。各 checkout 按项目 ID 和路径哈希隔离。
+Vivado/Vitis 路径、硬件服务器和串口保存在仓库外的 `fpga-flow.local.toml`。可通过 `FPGA_FLOW_LOCAL_CONFIG` 指定文件。Linux 状态目录为 `$XDG_STATE_HOME/fpga-flow`，默认 `~/.local/state/fpga-flow`。Windows 使用 `%LOCALAPPDATA%/FPGAFlow`。
 
-```toml
-[toolchains.vivado]
-command = ["/tools/AMDDesignTools/2025.2.1/Vivado/bin/vivado"]
+每次运行的日志、输入锁、产物和 `run.json` 位于消费工程的 `build/fpga-flow/runs/<run-id>/`。阶段指纹包括输入文件、依赖产物、命令、工具版本和目标身份。缓存命中时核验输出哈希，成功产物保持独立副本。
 
-[toolchains.vitis]
-command = ["/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis"]
-version_command = ["/tools/AMDDesignTools/2025.2.1/Vitis/bin/vitis", "--version"]
+JTAG、QSPI 和 UART 通过 provider 执行。持久写入使用 `--allow-destructive`，声明的外部副作用使用 `--allow-side-effects`。资源锁协调 Vivado、Vitis、板卡及串口。UART 支持字面或正则断言，并可等待当前命令回显后匹配响应。
 
-[targets.zybo_z7_20]
-hw_server_url = "tcp:127.0.0.1:3121"
-
-[targets.zybo_z7_20.uart]
-port = "/dev/serial/by-id/replace-with-board-adapter"
-```
-
-也可以通过 `FPGA_FLOW_LOCAL_CONFIG` 指定本地主机 overlay 文件。Overlay 支持调整 toolchain 命令、目标连接参数和阶段环境变量；项目硬件身份、阶段图、输入与产物仍由版本管理的 profile 定义。
-
-## 外部依赖与部署
-
-构建与部署日志、工具工作区和产物写入 `build/fpga-flow/runs/<run-id>/`。外部状态目录保存输入锁和短索引。下游消费通过哈希核验的生产 run 产物；硬件输入变化时使用干净综合与实现，默认关闭增量实现。
-
-可选的 `[exports]` 用 `directory` 和 `artifacts` 指定交付目录与 bundle 产物名。完整 bundle 成功后自动导出到本次生产 run 的独立子目录。未配置时不导出；已有交付目录不会被覆盖。
-
-外部源码依赖使用完整 Git commit 和输入文件模式锁定。阶段执行前后会校验依赖提交与工作树，依赖输入哈希进入阶段指纹。
-
-`side_effects` 用于声明会影响工程或板卡外部状态的阶段。持久存储写入需要显式授权；破坏性部署使用 `--allow-destructive`。部署、验证和构建记录分别保存在每次运行的不可变记录中。
-
-常用命令：
+## 开发与验证
 
 ```sh
-fpga-flow --version
-fpga-flow doctor --project fpga-project.toml --stage hardware
-fpga-flow resume --project fpga-project.toml --json
-fpga-flow watch --project fpga-project.toml --run-id RUN_ID --follow
-fpga-flow history --project fpga-project.toml --limit 20
-fpga-flow deploy --project fpga-project.toml --target zybo_z7_20 --stage deploy_jtag --allow-destructive
-fpga-flow release --project fpga-project.toml --target zybo_z7_20
-```
-
-## 开发与发布
-
-```sh
-python -m unittest discover -s tests -v
+PYTHONPATH=src python -m unittest discover -s tests -v
 python -m build
 ```
 
-发布工作流校验 tag 与包版本，运行单元测试，构建 wheel 和 source distribution，验证安装后的 CLI，并将安装包附加到版本 Release。FPGAFlow 仓库保持项目无关；具体 FPGA 项目的 profile 和源文件由各项目仓库管理。
+CI 在 Windows 和 Linux 执行主机测试。本轮 workspace、产物导入、UART、部署与安装验证见 [2026-11-24 交付记录](docs/validation-2026-11-24.md)。版本标签工作流构建 wheel 与源码包。
+
+## 许可
+
+FPGAFlow 使用 [Apache-2.0](LICENSE)。

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net"><diagram name="跨项目产物流程" id="workspace-dag"><mxGraphModel page="1" pageWidth="1200" pageHeight="720" grid="1" gridSize="10"><root>
+<mxCell id="0"/><mxCell id="1" parent="0"/>
+<mxCell id="source" value="共享 IP 源码&#xa;canonical RTL / 软件" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#edf4f8;strokeColor=#466d88;" vertex="1" parent="1"><mxGeometry x="70" y="70" width="280" height="90" as="geometry"/></mxCell>
+<mxCell id="release" value="验证与发布产物&#xa;IP ZIP · PS ZIP · SHA-256" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#edf4f8;strokeColor=#466d88;" vertex="1" parent="1"><mxGeometry x="460" y="70" width="280" height="90" as="geometry"/></mxCell>
+<mxCell id="import" value="校验并导入&#xa;版本 · VLNV · 目录树哈希" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#edf4f8;strokeColor=#466d88;" vertex="1" parent="1"><mxGeometry x="850" y="70" width="280" height="90" as="geometry"/></mxCell>
+<mxCell id="optional" value="消费项目回归（可选）&#xa;host / RTL" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#ffffff;strokeColor=#637d58;dashed=1;" vertex="1" parent="1"><mxGeometry x="850" y="280" width="280" height="90" as="geometry"/></mxCell>
+<mxCell id="build" value="消费项目构建&#xa;硬件 → platform → app → boot" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#f1f6ef;strokeColor=#637d58;" vertex="1" parent="1"><mxGeometry x="460" y="280" width="280" height="90" as="geometry"/></mxCell>
+<mxCell id="deploy" value="部署与运行验证&#xa;JTAG · UART · 板级检查" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#f1f6ef;strokeColor=#637d58;" vertex="1" parent="1"><mxGeometry x="70" y="280" width="280" height="90" as="geometry"/></mxCell>
+<mxCell id="archive" value="workspace 运行记录&#xa;项目指纹 · 依赖边 · stage run ID · 产物哈希 · 导入前后快照" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontSize=20;fillColor=#f4f6f8;strokeColor=#73808c;" vertex="1" parent="1"><mxGeometry x="70" y="500" width="1060" height="110" as="geometry"/></mxCell>
+<mxCell id="e1" edge="1" parent="1" source="source" target="release" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+<mxCell id="e2" edge="1" parent="1" source="release" target="import" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+<mxCell id="e3" edge="1" parent="1" source="import" target="optional" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+<mxCell id="e4" edge="1" parent="1" source="optional" target="build" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+<mxCell id="e5" edge="1" parent="1" source="build" target="deploy" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+<mxCell id="e6" edge="1" parent="1" source="build" target="archive" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;dashed=1;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+</root></mxGraphModel></diagram></mxfile>
