@@ -245,7 +245,7 @@ needs = ["import"]
         failed = {"done": False}
         def fail_second_install(source, destination):
             if (not failed["done"] and ".fpga-flow-import-1-" in str(source)
-                    and Path(destination) == ps_target):
+                    and Path(destination).resolve() == ps_target.resolve()):
                 failed["done"] = True
                 raise OSError("injected second target replace failure")
             return original(source, destination)
