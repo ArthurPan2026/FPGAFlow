@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="app.diagrams.net"><diagram name="执行架构" id="flow-overview"><mxGraphModel page="1" pageWidth="1200" pageHeight="650" grid="1" gridSize="10"><root>
-<mxCell id="0"/><mxCell id="1" parent="0"/>
+<mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="canvas-background" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=none;" vertex="1" parent="1"><mxGeometry x="0" y="0" width="1200" height="650" as="geometry"/></mxCell>
 <mxCell id="input-band" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f4f6f8;strokeColor=#73808c;" vertex="1" parent="1"><mxGeometry x="60" y="60" width="1080" height="140" as="geometry"/></mxCell>
 <mxCell id="engine-band" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#edf4f8;strokeColor=#466d88;" vertex="1" parent="1"><mxGeometry x="60" y="230" width="1080" height="160" as="geometry"/></mxCell>
 <mxCell id="output-band" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f1f6ef;strokeColor=#637d58;" vertex="1" parent="1"><mxGeometry x="60" y="420" width="1080" height="170" as="geometry"/></mxCell>
