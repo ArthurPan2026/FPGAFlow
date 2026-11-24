@@ -6,7 +6,7 @@ FPGAFlow 是面向 AMD Vivado/Vitis 工程的 Python 构建工具。它依据项
 
 ![FPGAFlow 架构总览](docs/figures/flow-overview.svg)
 
-图 1　项目清单描述工程，执行引擎调度阶段，provider 连接工具和设备。运行记录将源码、产物与验证结果关联。详细设计与跨项目流程见[架构说明](docs/architecture.md)。
+图 1 项目清单描述工程，执行引擎调度阶段，provider 连接工具和设备。运行记录将源码、产物与验证结果关联。详细设计与跨项目流程见[架构说明](docs/architecture.md)。
 
 ## 安装与开始使用
 

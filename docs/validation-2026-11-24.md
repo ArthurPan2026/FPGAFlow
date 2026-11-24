@@ -12,6 +12,8 @@ UART 增加 `require_command_echo`，在收到当前命令回显后匹配响应�
 
 ## 消费工程证据
 
+GitHub CI run `45315299670` 的 Windows 与 Linux 作业均通过。首轮 Windows 回滚测试使用临时目录的不同路径表示，故障注入未触发，修正为比较解析后的绝对路径，随后 11 项 workspace 测试和跨平台 CI 通过。
+
 GBA 通过 workspace 使用 EmbeddedVideoIP `0.3.0-dev.6 / coreRevision 7`。GBA hardware run `20261123T215815Z-8d4e4fd8d5` 的最终 setup WNS 为 `+0.003 ns`，hold WHS 为 `+0.050 ns`，TNS/THS 为 0，实际 DRC Error 为 0。
 
 JTAG run `20261124T013830Z-b30557490c` 和 QSPI run `20261124T014336Z-d05b0aa33c` 分别保存对应部署记录。消费项目的测试、硬件和人工结果收录于 GBA 验证文档。
